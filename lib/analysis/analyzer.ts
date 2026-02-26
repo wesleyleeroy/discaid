@@ -62,6 +62,7 @@ export async function analyzeTrack(
             sections: energyResult.sections,
             introEnd: energyResult.introEnd,
             outroStart: energyResult.outroStart,
+            effectiveEnd: energyResult.effectiveEnd,
             vocalRegions: energyResult.vocalRegions,
             analyzedAt: Date.now(),
         };
@@ -100,6 +101,7 @@ export function createFallbackAnalysis(audioBuffer: AudioBuffer): TrackAnalysis 
         }],
         introEnd: Math.min(8, duration * 0.1),
         outroStart: Math.max(duration - 16, duration * 0.85),
+        effectiveEnd: Math.max(duration - 4, duration * 0.9),
         vocalRegions: [],
         analyzedAt: Date.now(),
     };

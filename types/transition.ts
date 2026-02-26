@@ -91,6 +91,7 @@ export interface TransitionContext {
         loudnessDb: number;
         outroStart: number;
         duration: number;
+        effectiveEnd: number;
         hasVocalsInOutro: boolean;
         beatGrid: number[];
     };

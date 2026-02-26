@@ -18,6 +18,7 @@ interface EnergyResult {
     sections: TrackSection[];
     introEnd: number;         // seconds
     outroStart: number;       // seconds
+    effectiveEnd: number;     // seconds - where music actually ends (before fade/silence)
     vocalRegions: VocalActivity[];
 }
 
@@ -84,6 +85,7 @@ export function analyzeEnergy(audioBuffer: AudioBuffer): EnergyResult {
     const energyThreshold = 0.3;
     const introEnd = findIntroEnd(normalizedEnergies, windowDuration, energyThreshold);
     const outroStart = findOutroStart(normalizedEnergies, windowDuration, energyThreshold, audioBuffer.duration);
+    const effectiveEnd = findEffectiveEnd(data, sampleRate, audioBuffer.duration, outroStart);
 
     // ─── Section Segmentation ────────────────────────────────
     const sections = segmentSections(normalizedEnergies, windowDuration, audioBuffer.duration);
@@ -98,6 +100,7 @@ export function analyzeEnergy(audioBuffer: AudioBuffer): EnergyResult {
         sections,
         introEnd,
         outroStart,
+        effectiveEnd,
         vocalRegions,
     };
 }
@@ -125,26 +128,110 @@ function findIntroEnd(
 }
 
 /**
- * Find where the outro starts (last sustained high-energy region).
+ * Find where the outro starts — the point where the song begins dying off.
+ *
+ * Uses multiple strategies to detect the "death point":
+ * 1. Energy percentile drop: finds where energy falls below the track's
+ *    own energy median and stays there — catches fade-outs.
+ * 2. Gradient-based fade detection: finds sustained downward energy slope —
+ *    catches gradual fade-outs and trail-offs.
+ * 3. Silence/near-silence detection: finds where the track becomes very quiet.
+ *
+ * Returns the earliest credible point so the DJ can transition cleanly
+ * before the song gets boring or quiet.
  */
 function findOutroStart(
     energies: number[],
     windowDuration: number,
-    threshold: number,
+    _threshold: number,
     totalDuration: number
 ): number {
-    let consecutiveHigh = 0;
-    for (let i = energies.length - 1; i >= 0; i--) {
-        if (energies[i] >= threshold) {
-            consecutiveHigh++;
-            if (consecutiveHigh >= 3) {
-                return Math.min(totalDuration, (i + 3) * windowDuration);
+    if (energies.length < 6) return totalDuration * 0.8;
+
+    // Only look in the back 40% of the track (outro won't be in the first half)
+    const searchStart = Math.floor(energies.length * 0.6);
+    const candidates: number[] = [];
+
+    // ─── Strategy 1: Energy drops below track's own median ───────
+    // Compute median energy of the "body" (middle 60%) of the track
+    const bodyStart = Math.floor(energies.length * 0.15);
+    const bodyEnd = Math.floor(energies.length * 0.75);
+    const bodyEnergies = energies.slice(bodyStart, bodyEnd).sort((a, b) => a - b);
+    const medianEnergy = bodyEnergies[Math.floor(bodyEnergies.length / 2)] || 0.5;
+    const dropThreshold = medianEnergy * 0.4; // 40% of median = significant drop
+
+    let consecutiveLow = 0;
+    for (let i = searchStart; i < energies.length; i++) {
+        if (energies[i] < dropThreshold) {
+            consecutiveLow++;
+            if (consecutiveLow >= 2) {
+                // Mark the point where the drop started
+                candidates.push((i - consecutiveLow + 1) * windowDuration);
+                break;
             }
         } else {
-            consecutiveHigh = 0;
+            consecutiveLow = 0;
         }
     }
-    return totalDuration * 0.85; // Default: last 15%
+
+    // ─── Strategy 2: Gradient-based fade detection ───────────────
+    // Look for sustained downward energy slope (3+ windows of declining energy)
+    let fadeStart = -1;
+    let fadeLength = 0;
+    for (let i = searchStart + 1; i < energies.length; i++) {
+        const gradient = energies[i] - energies[i - 1];
+        if (gradient < -0.02) { // Declining
+            if (fadeStart === -1) fadeStart = i - 1;
+            fadeLength++;
+            if (fadeLength >= 3) {
+                candidates.push(fadeStart * windowDuration);
+                break;
+            }
+        } else {
+            fadeStart = -1;
+            fadeLength = 0;
+        }
+    }
+
+    // ─── Strategy 3: Near-silence detection ──────────────────────
+    // Find the first point in the tail where energy drops below 10%
+    for (let i = searchStart; i < energies.length; i++) {
+        if (energies[i] < 0.1) {
+            // Check if subsequent windows are also quiet (not just a brief dip)
+            const nextFew = energies.slice(i, Math.min(i + 3, energies.length));
+            const allQuiet = nextFew.every(e => e < 0.15);
+            if (allQuiet) {
+                candidates.push(i * windowDuration);
+                break;
+            }
+        }
+    }
+
+    // ─── Strategy 4: Last high-energy point (original approach) ──
+    let lastHigh = -1;
+    for (let i = energies.length - 1; i >= searchStart; i--) {
+        if (energies[i] >= 0.3) {
+            lastHigh = i;
+            break;
+        }
+    }
+    if (lastHigh >= 0) {
+        // Outro starts right after the last high-energy window
+        candidates.push(Math.min(totalDuration, (lastHigh + 1) * windowDuration));
+    }
+
+    // ─── Pick the earliest credible candidate ────────────────────
+    // Filter out anything too early (before 60% of the track)
+    const minOutro = totalDuration * 0.6;
+    const maxOutro = totalDuration * 0.95;
+    const validCandidates = candidates.filter(t => t >= minOutro && t <= maxOutro);
+
+    if (validCandidates.length > 0) {
+        return Math.min(...validCandidates);
+    }
+
+    // Default fallback: last 20% of the track
+    return totalDuration * 0.8;
 }
 
 /**
@@ -308,4 +395,74 @@ function estimateVocalActivity(
     }
 
     return regions;
+}
+
+/**
+ * Find the effective end of the track — where the actual music content stops.
+ *
+ * Scans backward from the end of the track to skip trailing silence,
+ * ambient decay, and very quiet fade-out tails. Returns the point where
+ * real music content effectively ends.
+ *
+ * This allows the DJ to stop the track cleanly rather than playing
+ * through several seconds of near-silence or fading out.
+ */
+function findEffectiveEnd(
+    data: Float32Array,
+    sampleRate: number,
+    totalDuration: number,
+    outroStart: number
+): number {
+    // Analyze from the end backward using 250ms windows
+    const windowDuration = 0.25;
+    const windowSamples = Math.floor(sampleRate * windowDuration);
+
+    // Threshold in linear amplitude: about -40dB
+    const silenceThreshold = 0.01;
+    // Threshold for "very quiet": about -30dB
+    const quietThreshold = 0.03;
+
+    // Start from the very end and scan backward
+    let effectiveEnd = totalDuration;
+    let consecutiveQuiet = 0;
+
+    const numWindows = Math.floor(data.length / windowSamples);
+    for (let w = numWindows - 1; w >= 0; w--) {
+        const start = w * windowSamples;
+        let wSum = 0;
+        for (let i = 0; i < windowSamples && (start + i) < data.length; i++) {
+            const s = data[start + i];
+            wSum += s * s;
+        }
+        const wRms = Math.sqrt(wSum / windowSamples);
+
+        if (wRms < silenceThreshold) {
+            // True silence — skip entirely
+            effectiveEnd = w * windowDuration;
+            continue;
+        }
+
+        if (wRms < quietThreshold) {
+            consecutiveQuiet++;
+            // If we've had 2+ seconds of very quiet, that's a fade-out
+            if (consecutiveQuiet >= 8) { // 8 * 0.25s = 2 seconds
+                effectiveEnd = (w + 8) * windowDuration;
+            }
+            continue;
+        }
+
+        // Found real music content — this is our effective end
+        // Add a small buffer (0.5s) for natural decay
+        effectiveEnd = Math.min(totalDuration, (w + 1) * windowDuration + 0.5);
+        break;
+    }
+
+    // Effective end should be at least at the outro start
+    // (we don't want to cut the track before the outro even begins)
+    effectiveEnd = Math.max(outroStart, effectiveEnd);
+
+    // But shouldn't be more than 2 seconds beyond the end
+    effectiveEnd = Math.min(totalDuration, effectiveEnd);
+
+    return Math.round(effectiveEnd * 10) / 10;
 }

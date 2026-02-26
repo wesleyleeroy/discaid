@@ -1,9 +1,11 @@
 /**
  * Now Playing — Displays current and next track info with analysis badges.
+ * Progress bar supports click-to-seek and drag-to-scrub.
  */
 
 'use client';
 
+import { useRef, useState, useCallback } from 'react';
 import { useDJStore } from '@/stores/dj-store';
 
 function formatTime(seconds: number): string {
@@ -21,10 +23,67 @@ export default function NowPlaying() {
     const currentDuration = useDJStore(s => s.currentDuration);
     const orchestratorState = useDJStore(s => s.orchestratorState);
     const activeDeck = useDJStore(s => s.activeDeck);
+    const seekTo = useDJStore(s => s.seekTo);
 
     const currentTrack = currentTrackId ? tracks[currentTrackId] : null;
     const nextTrack = nextTrackId ? tracks[nextTrackId] : null;
     const progress = currentDuration > 0 ? (currentPosition / currentDuration) * 100 : 0;
+
+    // ─── Seek Bar State ────────────────────────────────────────
+    const barRef = useRef<HTMLDivElement>(null);
+    const [isDragging, setIsDragging] = useState(false);
+    const [hoverPosition, setHoverPosition] = useState<number | null>(null);
+    const [dragProgress, setDragProgress] = useState<number | null>(null);
+
+    const isTransitioning = orchestratorState === 'transitioning';
+
+    const getPositionFromEvent = useCallback((e: React.PointerEvent | PointerEvent): number => {
+        if (!barRef.current || currentDuration <= 0) return 0;
+        const rect = barRef.current.getBoundingClientRect();
+        const fraction = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        return fraction * currentDuration;
+    }, [currentDuration]);
+
+    const handlePointerDown = useCallback((e: React.PointerEvent) => {
+        if (isTransitioning || !currentTrack) return;
+        e.preventDefault();
+        setIsDragging(true);
+        barRef.current?.setPointerCapture(e.pointerId);
+
+        const pos = getPositionFromEvent(e);
+        setDragProgress((pos / currentDuration) * 100);
+    }, [isTransitioning, currentTrack, getPositionFromEvent, currentDuration]);
+
+    const handlePointerMove = useCallback((e: React.PointerEvent) => {
+        const pos = getPositionFromEvent(e);
+
+        if (isDragging) {
+            setDragProgress((pos / currentDuration) * 100);
+        } else {
+            setHoverPosition(pos);
+        }
+    }, [isDragging, getPositionFromEvent, currentDuration]);
+
+    const handlePointerUp = useCallback((e: React.PointerEvent) => {
+        if (!isDragging) return;
+        setIsDragging(false);
+        setDragProgress(null);
+        barRef.current?.releasePointerCapture(e.pointerId);
+
+        const pos = getPositionFromEvent(e);
+        seekTo(pos);
+    }, [isDragging, getPositionFromEvent, seekTo]);
+
+    const handlePointerLeave = useCallback(() => {
+        if (!isDragging) {
+            setHoverPosition(null);
+        }
+    }, [isDragging]);
+
+    const displayProgress = isDragging && dragProgress !== null ? dragProgress : progress;
+    const displayTime = isDragging && dragProgress !== null
+        ? (dragProgress / 100) * currentDuration
+        : currentPosition;
 
     return (
         <div className="glass-card-static p-6 space-y-4">
@@ -39,9 +98,9 @@ export default function NowPlaying() {
                     </span>
                     {orchestratorState !== 'idle' && (
                         <span className={`badge ${orchestratorState === 'transitioning' ? 'badge-pink' :
-                                orchestratorState === 'planning' ? 'badge-amber' :
-                                    orchestratorState === 'pre-transition' ? 'badge-purple' :
-                                        'badge-green'
+                            orchestratorState === 'planning' ? 'badge-amber' :
+                                orchestratorState === 'pre-transition' ? 'badge-purple' :
+                                    'badge-green'
                             }`}>
                             {orchestratorState === 'transitioning' ? '⚡ Mixing' :
                                 orchestratorState === 'planning' ? '🧠 Planning' :
@@ -82,24 +141,60 @@ export default function NowPlaying() {
                             <span className="badge badge-amber">
                                 🔊 {currentTrack.analysis.loudnessDb} dB
                             </span>
+                            {currentTrack.analysis.effectiveEnd < currentTrack.analysis.durationSeconds - 2 && (
+                                <span className="badge badge-pink" title={`Skipping ${Math.round(currentTrack.analysis.durationSeconds - currentTrack.analysis.effectiveEnd)}s of quiet ending`}>
+                                    ✂️ Early stop −{Math.round(currentTrack.analysis.durationSeconds - currentTrack.analysis.effectiveEnd)}s
+                                </span>
+                            )}
                         </div>
                     )}
 
-                    {/* Progress Bar */}
+                    {/* Interactive Progress / Seek Bar */}
                     <div className="space-y-1">
-                        <div className="relative h-1.5 rounded-full overflow-hidden" style={{ background: 'rgba(100,100,180,0.15)' }}>
+                        <div
+                            ref={barRef}
+                            className="seek-bar-container"
+                            style={{
+                                cursor: isTransitioning ? 'not-allowed' : 'pointer',
+                            }}
+                            onPointerDown={handlePointerDown}
+                            onPointerMove={handlePointerMove}
+                            onPointerUp={handlePointerUp}
+                            onPointerLeave={handlePointerLeave}
+                        >
+                            {/* Track background */}
+                            <div className="seek-bar-track" />
+
+                            {/* Hover preview (ghost bar) */}
+                            {hoverPosition !== null && !isDragging && !isTransitioning && (
+                                <div
+                                    className="seek-bar-hover"
+                                    style={{
+                                        width: `${(hoverPosition / currentDuration) * 100}%`,
+                                    }}
+                                />
+                            )}
+
+                            {/* Progress fill */}
                             <div
-                                className="absolute top-0 left-0 h-full rounded-full transition-all duration-200"
+                                className="seek-bar-fill"
                                 style={{
-                                    width: `${progress}%`,
-                                    background: 'linear-gradient(90deg, var(--accent-cyan), var(--accent-purple))',
-                                    boxShadow: '0 0 8px rgba(0, 212, 255, 0.5)',
+                                    width: `${displayProgress}%`,
+                                }}
+                            />
+
+                            {/* Playhead thumb (visible on hover & drag) */}
+                            <div
+                                className={`seek-bar-thumb ${isDragging ? 'seek-bar-thumb-active' : ''}`}
+                                style={{
+                                    left: `${displayProgress}%`,
                                 }}
                             />
                         </div>
+
                         <div className="flex justify-between" style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                            <span>{formatTime(currentPosition)}</span>
-                            <span>-{formatTime(currentDuration - currentPosition)}</span>
+                            <span>{formatTime(displayTime)}</span>
+                            <span>-{formatTime(currentDuration - displayTime)}</span>
                         </div>
                     </div>
                 </>

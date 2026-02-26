@@ -67,6 +67,7 @@ export interface TrackAnalysis {
   sections: TrackSection[];
   introEnd: number;          // seconds - where intro ends
   outroStart: number;        // seconds - where outro begins
+  effectiveEnd: number;      // seconds - where song should stop (before silence/fade)
   vocalRegions: VocalActivity[];
   analyzedAt: number;        // timestamp ms
 }

@@ -22,6 +22,14 @@ import { planTransition } from '@/lib/orchestrator/planner';
 import { executeTransition, emergencyCrossfade } from '@/lib/audio/mixer';
 import { validateAudioFile, sanitizeFilename } from '@/lib/ingestion/validator';
 import { TRANSITION_LOOKAHEAD } from '@/lib/utils/constants';
+import {
+    scheduleLiveFX,
+    startFXMonitor,
+    stopFXMonitor,
+    onFXStateChange,
+    type ScheduledFX,
+    type LiveFXState,
+} from '@/lib/audio/live-fx';
 
 interface DJState {
     // ─── Track Management ─────────────────────────────────────
@@ -55,6 +63,11 @@ interface DJState {
     // ─── Rights Confirmation ──────────────────────────────────
     rightsConfirmed: boolean;
 
+    // ─── Live FX ─────────────────────────────────────────────
+    activeFX: ScheduledFX | null;
+    nextFXEta: number | null;
+    fxEnabled: boolean;
+
     // ─── Actions ──────────────────────────────────────────────
     setRightsConfirmed: (confirmed: boolean) => void;
     addTrack: (file: File) => Promise<void>;
@@ -63,6 +76,7 @@ interface DJState {
     toggleAI: () => void;
     removeFromQueue: (trackId: string) => void;
     addInsight: (type: AIInsight['type'], message: string, details?: Record<string, unknown>) => void;
+    seekTo: (position: number) => void;
     updatePosition: () => void;
     initialize: () => Promise<void>;
 }
@@ -86,6 +100,9 @@ export const useDJStore = create<DJState>((set, get) => ({
     insights: [],
     analysisProgress: null,
     rightsConfirmed: false,
+    activeFX: null,
+    nextFXEta: null,
+    fxEnabled: true,
 
     // ─── Rights Confirmation ────────────────────────────────────
     setRightsConfirmed: (confirmed) => set({ rightsConfirmed: confirmed }),
@@ -209,6 +226,14 @@ export const useDJStore = create<DJState>((set, get) => ({
                 `(${analysis.key.camelotCode}), Energy ${(analysis.energy * 100).toFixed(0)}%`
             );
 
+            // Log smart ending detection
+            const savedTime = Math.round(audioBuffer.duration - analysis.effectiveEnd);
+            if (savedTime > 2) {
+                state.addInsight('decision',
+                    `✂️ Smart ending: will stop ${savedTime}s early (skipping quiet fade-out)`
+                );
+            }
+
             // Trigger orchestrator
             orchestrate();
 
@@ -305,6 +330,48 @@ export const useDJStore = create<DJState>((set, get) => ({
         get().addInsight('info', `🗑️ Removed track from queue`);
     },
 
+    // ─── Seek To Position ──────────────────────────────────────
+    seekTo: (position: number) => {
+        const state = get();
+
+        // Don't seek during transitions — it would break the mix
+        if (state.orchestratorState === 'transitioning') return;
+
+        // Must be playing something
+        if (!state.isPlaying || !state.currentTrackId) return;
+
+        const currentTrack = state.tracks[state.currentTrackId];
+        if (!currentTrack) return;
+
+        const maxTime = currentTrack.duration ?? 0;
+        const clampedPosition = Math.max(0, Math.min(position, maxTime - 0.5));
+
+        // Seek the audio engine
+        audioEngine.seekDeck(state.activeDeck, clampedPosition);
+
+        // Stop current FX monitor and reschedule for new position
+        stopFXMonitor();
+        if (currentTrack.analysis && state.fxEnabled) {
+            // Reschedule FX — effects before seeking position will auto-skip
+            // since they'll be marked as executed by checkAndFireFX
+            const effects = scheduleLiveFX(currentTrack.analysis, state.activeDeck);
+            // Mark effects before the seek position as already executed
+            for (const fx of effects) {
+                if (fx.triggerTime + fx.duration < clampedPosition) {
+                    fx.executed = true;
+                }
+            }
+            startFXMonitor(state.activeDeck, currentTrack.analysis.bpm);
+        }
+
+        // Clear any pending transition plan since timing has changed
+        set({
+            currentPosition: clampedPosition,
+            currentPlan: null,
+            transitionEta: null,
+        });
+    },
+
     // ─── Update Position ───────────────────────────────────────
     updatePosition: () => {
         const state = get();
@@ -314,19 +381,24 @@ export const useDJStore = create<DJState>((set, get) => ({
         const remaining = audioEngine.getDeckRemaining(state.activeDeck);
         const currentTrack = state.currentTrackId ? state.tracks[state.currentTrackId] : null;
 
+        // Use effectiveEnd for transition timing (skip quiet endings)
+        const effectiveEnd = currentTrack?.analysis?.effectiveEnd ?? currentTrack?.duration ?? 0;
+        const effectiveRemaining = Math.max(0, effectiveEnd - position);
+
         set({
             currentPosition: position,
             currentDuration: currentTrack?.duration ?? 0,
             transitionEta: state.currentPlan
                 ? Math.max(0, (state.currentPlan.transitionStartTime - position))
-                : remaining < TRANSITION_LOOKAHEAD ? remaining : null,
+                : effectiveRemaining < TRANSITION_LOOKAHEAD ? effectiveRemaining : null,
         });
 
         // Check if we should start planning a transition
+        // Use effectiveEnd (before fade-out) instead of full track duration
         if (
             state.aiActive &&
             state.orchestratorState === 'playing' &&
-            remaining < TRANSITION_LOOKAHEAD &&
+            effectiveRemaining < TRANSITION_LOOKAHEAD &&
             !state.currentPlan
         ) {
             orchestrate();
@@ -372,6 +444,17 @@ function orchestrate() {
                     });
 
                     state.addInsight('decision', `🎵 Now playing: "${track.title}" by ${track.artist}`);
+
+                    // Start live FX if track has analysis
+                    if (track.analysis && state.fxEnabled) {
+                        const effects = scheduleLiveFX(track.analysis, 'A');
+                        startFXMonitor('A', track.analysis.bpm);
+                        if (effects.length > 0) {
+                            state.addInsight('info',
+                                `🎛️ Scheduled ${effects.length} live FX: ${effects.map(e => e.type).join(', ')}`
+                            );
+                        }
+                    }
 
                     // Start position update loop
                     startPositionLoop();
@@ -460,14 +543,24 @@ async function executeTransitionSequence(plan: TransitionPlan, nextTrackId: stri
         `🎛️ Executing ${plan.strategy} transition → "${nextTrack.title}"`
     );
 
-    useDJStore.setState({ orchestratorState: 'transitioning' });
+    // Stop live FX before transitioning (they'd clash with automation)
+    stopFXMonitor();
+
+    useDJStore.setState({ orchestratorState: 'transitioning', activeFX: null, nextFXEta: null });
 
     // Load next track on opposing deck and start it
+    // Reset the incoming deck's gain to ensure it's audible
+    // (it may have been silenced by a previous transition's finalizeTransition)
+    const nextDeckNodes = audioEngine.getDeck(nextDeck as 'A' | 'B');
+    if (nextDeckNodes) {
+        audioEngine.setParam(nextDeckNodes.inputGain.gain, 0); // Start silent, transition will fade in
+        audioEngine.setParam(nextDeckNodes.outputGain.gain, 1); // Ensure output path is open
+    }
     audioEngine.loadTrack(nextDeck as 'A' | 'B', nextTrack.audioBuffer, true);
 
-    // Execute the transition
+    // Execute the transition (pass actual deck assignment for correct parameter routing)
     try {
-        await executeTransition(plan, (progress) => {
+        await executeTransition(plan, currentDeck, nextDeck as 'A' | 'B', (progress) => {
             useDJStore.setState({ transitionProgress: progress });
         });
     } catch {
@@ -504,6 +597,19 @@ async function executeTransitionSequence(plan: TransitionPlan, nextTrackId: stri
 
     state.addInsight('decision', `✅ Transition complete. Now playing: "${nextTrack.title}"`);
 
+    // Start live FX for the new track
+    const latestState = useDJStore.getState();
+    if (nextTrack.analysis && latestState.fxEnabled) {
+        const newDeckTyped = nextDeck as 'A' | 'B';
+        const effects = scheduleLiveFX(nextTrack.analysis, newDeckTyped);
+        startFXMonitor(newDeckTyped, nextTrack.analysis.bpm);
+        if (effects.length > 0) {
+            state.addInsight('info',
+                `🎛️ Scheduled ${effects.length} live FX for "${nextTrack.title}"`
+            );
+        }
+    }
+
     // Continue orchestrating (plan next transition if queue has tracks)
     setTimeout(orchestrate, 2000);
 }
@@ -524,6 +630,15 @@ function handleDeckEnd(deck: 'A' | 'B') {
             const nextTrack = state.tracks[readyNext];
             if (nextTrack?.audioBuffer) {
                 const newDeck = deck === 'A' ? 'B' : 'A';
+
+                // Reset the new deck's gain to 1 — it may be 0
+                // from a previous transition's finalizeTransition
+                const newDeckNodes = audioEngine.getDeck(newDeck);
+                if (newDeckNodes) {
+                    audioEngine.setParam(newDeckNodes.inputGain.gain, 1);
+                    audioEngine.setParam(newDeckNodes.outputGain.gain, 1);
+                }
+
                 audioEngine.loadTrack(newDeck as 'A' | 'B', nextTrack.audioBuffer, true);
 
                 useDJStore.setState({
@@ -559,3 +674,11 @@ function startPositionLoop() {
         useDJStore.getState().updatePosition();
     }, 100);
 }
+
+// ─── FX State Listener (syncs FX engine state → Zustand store) ──
+onFXStateChange((fxState: LiveFXState) => {
+    useDJStore.setState({
+        activeFX: fxState.activeEffect,
+        nextFXEta: fxState.nextEffectEta,
+    });
+});

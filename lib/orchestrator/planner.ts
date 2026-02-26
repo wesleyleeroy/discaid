@@ -66,6 +66,7 @@ export function planTransition(
             loudnessDb: outgoingAnalysis.loudnessDb,
             outroStart: outgoingAnalysis.outroStart,
             duration: outgoingAnalysis.durationSeconds,
+            effectiveEnd: outgoingAnalysis.effectiveEnd,
             hasVocalsInOutro,
             beatGrid: outgoingAnalysis.beatGrid,
         },
@@ -195,16 +196,21 @@ function computeOverlapDuration(
 
 /**
  * Compute the point in the outgoing track where transition should begin.
- * Prefers the outro start; falls back to a safe buffer before track end.
+ * Uses effectiveEnd (the real music endpoint) rather than total duration.
+ * Prefers the outro start; falls back to a safe buffer before the effective end.
  */
 function computeTransitionPoint(analysis: TrackAnalysis, overlapDuration: number): number {
-    // Primary: start transition at the outro
-    if (analysis.outroStart > 0 && analysis.outroStart < analysis.durationSeconds) {
-        return analysis.outroStart;
+    const effectiveEnd = analysis.effectiveEnd;
+
+    // Primary: start transition at the outro (but don't go past effectiveEnd)
+    if (analysis.outroStart > 0 && analysis.outroStart < effectiveEnd) {
+        // Ensure the transition finishes before or at the effective end
+        const maxStart = effectiveEnd - overlapDuration;
+        return Math.max(0, Math.min(analysis.outroStart, maxStart));
     }
 
-    // Fallback: start overlap duration before the end
-    return Math.max(0, analysis.durationSeconds - overlapDuration - 2);
+    // Fallback: start overlap duration before the effective end
+    return Math.max(0, effectiveEnd - overlapDuration - 2);
 }
 
 /**

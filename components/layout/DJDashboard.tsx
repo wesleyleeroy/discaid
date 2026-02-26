@@ -13,6 +13,7 @@ import QueuePanel from '@/components/dj/QueuePanel';
 import TransitionStatus from '@/components/dj/TransitionStatus';
 import AIInsightPanel from '@/components/dj/AIInsightPanel';
 import PlaybackControls from '@/components/dj/PlaybackControls';
+import LiveFXStatus from '@/components/dj/LiveFXStatus';
 
 export default function DJDashboard() {
     const initialize = useDJStore(s => s.initialize);
@@ -86,8 +87,9 @@ export default function DJDashboard() {
                         <IngestionGate />
                     </div>
 
-                    {/* Right column — Queue & AI */}
+                    {/* Right column — Queue, FX & AI */}
                     <div className="space-y-6">
+                        <LiveFXStatus />
                         <QueuePanel />
                         <AIInsightPanel />
                     </div>
@@ -98,8 +100,8 @@ export default function DJDashboard() {
                     <div className="flex items-center gap-4">
                         <span className="flex items-center gap-1">
                             <span className={`w-1.5 h-1.5 rounded-full ${orchestratorState === 'idle' ? 'bg-[var(--text-muted)]' :
-                                    orchestratorState === 'error' ? 'bg-[var(--accent-red)]' :
-                                        'bg-[var(--accent-green)] animate-pulse-glow'
+                                orchestratorState === 'error' ? 'bg-[var(--accent-red)]' :
+                                    'bg-[var(--accent-green)] animate-pulse-glow'
                                 }`} />
                             Engine: {orchestratorState}
                         </span>

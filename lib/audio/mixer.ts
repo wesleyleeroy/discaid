@@ -12,9 +12,18 @@ import { FILTER_MAX_FREQ, FILTER_DEFAULT_Q } from '@/lib/utils/constants';
 /**
  * Execute a transition plan by scheduling automation on the audio engine.
  * Returns a Promise that resolves when the transition overlap period ends.
+ *
+ * @param outgoingDeck - The deck currently playing (being transitioned FROM)
+ * @param incomingDeck - The deck being transitioned TO
+ *
+ * Transition strategies always generate envelopes assuming "A = outgoing, B = incoming".
+ * When the actual decks are reversed (B is outgoing), we remap parameter names
+ * so the automation targets the correct physical deck.
  */
 export function executeTransition(
     plan: TransitionPlan,
+    outgoingDeck: 'A' | 'B' = 'A',
+    incomingDeck: 'A' | 'B' = 'B',
     onProgress?: (progress: number) => void
 ): Promise<void> {
     return new Promise((resolve) => {
@@ -28,9 +37,16 @@ export function executeTransition(
         resetDeckParams('A');
         resetDeckParams('B');
 
+        // If decks are swapped (B is outgoing), remap parameter names
+        // so the envelopes target the correct physical deck
+        const needsRemap = outgoingDeck === 'B';
+
         // Schedule all envelopes
         for (const envelope of plan.envelopes) {
-            scheduleEnvelope(envelope);
+            const remappedEnvelope = needsRemap
+                ? { ...envelope, parameter: remapParam(envelope.parameter) }
+                : envelope;
+            scheduleEnvelope(remappedEnvelope);
         }
 
         // Track progress during transition
@@ -53,7 +69,7 @@ export function executeTransition(
 
                 // Clean up: ensure outgoing deck is stopped
                 // and incoming deck is at full volume with clean params
-                finalizeTransition(plan);
+                finalizeTransition(outgoingDeck, incomingDeck);
                 resolve();
             }
         }, 50); // Update at ~20fps
@@ -72,6 +88,7 @@ function resetDeckParams(deck: 'A' | 'B'): void {
     audioEngine.setParam(deckNodes.eqHigh.gain, 0);
     audioEngine.setParam(deckNodes.filter.frequency, FILTER_MAX_FREQ);
     audioEngine.setParam(deckNodes.filter.Q, FILTER_DEFAULT_Q);
+    audioEngine.setParam(deckNodes.outputGain.gain, 1); // Ensure output path is always open
     audioEngine.setParam(deckNodes.reverbSend.gain, 0);
     audioEngine.setParam(deckNodes.delaySend.gain, 0);
 }
@@ -130,22 +147,48 @@ function resolveParam(paramName: AutomationParameter): AudioParam | null {
 }
 
 /**
- * Finalize a transition: stop outgoing deck, clean up incoming deck params.
+ * Remap an automation parameter name: swap A ↔ B.
+ * Used when the outgoing deck is B rather than A, so that
+ * envelopes generated with the A=outgoing convention
+ * target the correct physical deck.
  */
-function finalizeTransition(plan: TransitionPlan): void {
-    // Determine which deck was outgoing and which is incoming
-    // Convention: A is outgoing, B is incoming (they swap each transition)
-    const deckA = audioEngine.getDeck('A');
-    const deckB = audioEngine.getDeck('B');
-    if (!deckA || !deckB) return;
+function remapParam(param: AutomationParameter): AutomationParameter {
+    const swaps: Partial<Record<AutomationParameter, AutomationParameter>> = {
+        'gainA': 'gainB',
+        'gainB': 'gainA',
+        'lowEqA': 'lowEqB',
+        'lowEqB': 'lowEqA',
+        'midEqA': 'midEqB',
+        'midEqB': 'midEqA',
+        'highEqA': 'highEqB',
+        'highEqB': 'highEqA',
+        'filterFreqA': 'filterFreqB',
+        'filterFreqB': 'filterFreqA',
+        'filterQA': 'filterQB',
+        'filterQB': 'filterQA',
+        'reverbSendA': 'reverbSendB',
+        'reverbSendB': 'reverbSendA',
+        'delaySendA': 'delaySendB',
+        'delaySendB': 'delaySendA',
+    };
+    return swaps[param] ?? param;
+}
 
-    // Reset all parameters on the new active deck (B)
-    audioEngine.setParam(deckB.inputGain.gain, 1);
-    resetDeckParams('B');
+/**
+ * Finalize a transition: clean up incoming deck params, silence outgoing.
+ */
+function finalizeTransition(outgoingDeck: 'A' | 'B', incomingDeck: 'A' | 'B'): void {
+    const incoming = audioEngine.getDeck(incomingDeck);
+    const outgoing = audioEngine.getDeck(outgoingDeck);
+    if (!incoming || !outgoing) return;
+
+    // Incoming deck to full volume with clean params
+    audioEngine.setParam(incoming.inputGain.gain, 1);
+    resetDeckParams(incomingDeck);
 
     // Silence outgoing deck
-    audioEngine.setParam(deckA.inputGain.gain, 0);
-    resetDeckParams('A');
+    audioEngine.setParam(outgoing.inputGain.gain, 0);
+    resetDeckParams(outgoingDeck);
 
     // Reset FX
     const delayFeedback = audioEngine.getDelayFeedback();

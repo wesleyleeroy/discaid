@@ -372,6 +372,47 @@ class AudioEngine {
     }
 
     /**
+     * Seek a deck to a specific position in seconds.
+     * AudioBufferSourceNodes are single-use, so we stop the current one
+     * and create a new source starting at the target offset.
+     * All audio graph connections (gain, EQ, filter, sends) are preserved
+     * because they're on the deck nodes, not the source.
+     */
+    seekDeck(deck: 'A' | 'B', targetTime: number): void {
+        if (!this.ctx) return;
+        const buffer = deck === 'A' ? this.deckABuffer : this.deckBBuffer;
+        if (!buffer) return;
+
+        const wasPlaying = deck === 'A' ? this._state.deckAPlaying : this._state.deckBPlaying;
+        const clampedTime = Math.max(0, Math.min(targetTime, buffer.duration - 0.1));
+
+        // Stop current source without clearing the playing state
+        const deckNodes = deck === 'A' ? this.deckA! : this.deckB!;
+        if (deckNodes?.source) {
+            try {
+                deckNodes.source.onended = null; // prevent the onended callback from firing
+                deckNodes.source.stop();
+            } catch {
+                // Source may already be stopped
+            }
+            deckNodes.source.disconnect();
+            deckNodes.source = null;
+        }
+
+        // Update offset
+        if (deck === 'A') {
+            this.deckAOffset = clampedTime;
+        } else {
+            this.deckBOffset = clampedTime;
+        }
+
+        // Restart playback from new position if it was playing
+        if (wasPlaying) {
+            this.playDeck(deck, clampedTime);
+        }
+    }
+
+    /**
      * Get the remaining time on a deck.
      */
     getDeckRemaining(deck: 'A' | 'B'): number {
