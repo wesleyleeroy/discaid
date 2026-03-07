@@ -22,6 +22,8 @@ import { planTransition } from '@/lib/orchestrator/planner';
 import { executeTransition, emergencyCrossfade } from '@/lib/audio/mixer';
 import { validateAudioFile, sanitizeFilename } from '@/lib/ingestion/validator';
 import { TRANSITION_LOOKAHEAD } from '@/lib/utils/constants';
+import { processStemSeparation, type StemData } from '@/lib/audio/stem-separator';
+import { vocalPlayer, instrumentalPlayer } from '@/lib/audio/stem-player';
 import {
     scheduleLiveFX,
     startFXMonitor,
@@ -60,6 +62,9 @@ interface DJState {
     // ─── Analysis Progress ────────────────────────────────────
     analysisProgress: { stage: string; progress: number; message: string } | null;
 
+    // ─── Stem Separation ──────────────────────────────────────
+    stemData: Record<string, StemData>;
+
     // ─── Rights Confirmation ──────────────────────────────────
     rightsConfirmed: boolean;
 
@@ -67,6 +72,14 @@ interface DJState {
     activeFX: ScheduledFX | null;
     nextFXEta: number | null;
     fxEnabled: boolean;
+
+    // ─── Stem Playback ───────────────────────────────────────
+    stemVocalPlaying: boolean;
+    stemInstrumentalPlaying: boolean;
+    stemVocalPosition: number;
+    stemInstrumentalPosition: number;
+    stemVocalDuration: number;
+    stemInstrumentalDuration: number;
 
     // ─── Actions ──────────────────────────────────────────────
     setRightsConfirmed: (confirmed: boolean) => void;
@@ -79,6 +92,12 @@ interface DJState {
     seekTo: (position: number) => void;
     updatePosition: () => void;
     initialize: () => Promise<void>;
+    triggerRewind: () => void;
+    toggleStemVocal: () => void;
+    toggleStemInstrumental: () => void;
+    seekStemVocal: (position: number) => void;
+    seekStemInstrumental: (position: number) => void;
+    loadStemPlayers: (trackId: string) => void;
 }
 
 export const useDJStore = create<DJState>((set, get) => ({
@@ -103,6 +122,13 @@ export const useDJStore = create<DJState>((set, get) => ({
     activeFX: null,
     nextFXEta: null,
     fxEnabled: true,
+    stemData: {},
+    stemVocalPlaying: false,
+    stemInstrumentalPlaying: false,
+    stemVocalPosition: 0,
+    stemInstrumentalPosition: 0,
+    stemVocalDuration: 0,
+    stemInstrumentalDuration: 0,
 
     // ─── Rights Confirmation ────────────────────────────────────
     setRightsConfirmed: (confirmed) => set({ rightsConfirmed: confirmed }),
@@ -234,6 +260,30 @@ export const useDJStore = create<DJState>((set, get) => ({
                 );
             }
 
+            // ─── Stem Separation (non-blocking, async) ──────────────
+            try {
+                state.addInsight('info', `🎚️ Isolating vocals for "${title}"... (this may take a moment)`);
+                // Use setTimeout + async to avoid blocking the main thread
+                setTimeout(async () => {
+                    try {
+                        const stems = await processStemSeparation(audioBuffer, 200);
+                        useDJStore.setState((s) => ({
+                            stemData: { ...s.stemData, [track.id]: stems },
+                        }));
+                        // Load stem players so they're ready for independent playback
+                        get().loadStemPlayers(track.id);
+                        get().addInsight('decision',
+                            `🎤 Vocals isolated for "${title}" — Quality: ${Math.round(stems.separationQuality * 100)}%`
+                        );
+                    } catch (stemErr) {
+                        get().addInsight('warning', `⚠️ Vocal isolation failed for "${title}"`);
+                    }
+                }, 50);
+            } catch {
+                // Non-critical — stem separation failure shouldn't block playback
+                state.addInsight('warning', `⚠️ Could not start vocal isolation for "${title}"`);
+            }
+
             // Trigger orchestrator
             orchestrate();
 
@@ -303,12 +353,18 @@ export const useDJStore = create<DJState>((set, get) => ({
     togglePause: () => {
         const state = get();
         if (state.isPaused) {
-            audioEngine.resume();
+            // Resume: restart deck from saved position
+            const deck = state.activeDeck;
+            const pos = state.currentPosition;
+            audioEngine.playDeck(deck, pos);
             set({ isPaused: false });
             state.addInsight('info', '▶️ Playback resumed');
         } else {
-            audioEngine.suspend();
-            set({ isPaused: true });
+            // Pause: use pauseDeck (not stopDeck!) — this nullifies onended
+            // so the orchestrator won't think the track ended
+            const deck = state.activeDeck;
+            const pos = audioEngine.pauseDeck(deck);
+            set({ isPaused: true, currentPosition: pos });
             state.addInsight('info', '⏸️ Playback paused');
         }
     },
@@ -372,6 +428,16 @@ export const useDJStore = create<DJState>((set, get) => ({
         });
     },
 
+    // ─── Rewind / Word Effect (one-shot) ────────────────────────
+    triggerRewind: () => {
+        const state = get();
+        if (!state.isPlaying || !state.currentTrackId) return;
+        if (state.orchestratorState === 'transitioning') return;
+
+        audioEngine.rewindSnippet(state.activeDeck, 0.75);
+        state.addInsight('info', '⏪ Rewind triggered');
+    },
+
     // ─── Update Position ───────────────────────────────────────
     updatePosition: () => {
         const state = get();
@@ -385,9 +451,19 @@ export const useDJStore = create<DJState>((set, get) => ({
         const effectiveEnd = currentTrack?.analysis?.effectiveEnd ?? currentTrack?.duration ?? 0;
         const effectiveRemaining = Math.max(0, effectiveEnd - position);
 
+        // Update stem playback positions
+        const stemVocalPosition = vocalPlayer.getPosition();
+        const stemInstrumentalPosition = instrumentalPlayer.getPosition();
+        const stemVocalPlaying = vocalPlayer.isPlaying;
+        const stemInstrumentalPlaying = instrumentalPlayer.isPlaying;
+
         set({
             currentPosition: position,
             currentDuration: currentTrack?.duration ?? 0,
+            stemVocalPosition,
+            stemInstrumentalPosition,
+            stemVocalPlaying,
+            stemInstrumentalPlaying,
             transitionEta: state.currentPlan
                 ? Math.max(0, (state.currentPlan.transitionStartTime - position))
                 : effectiveRemaining < TRANSITION_LOOKAHEAD ? effectiveRemaining : null,
@@ -402,6 +478,58 @@ export const useDJStore = create<DJState>((set, get) => ({
             !state.currentPlan
         ) {
             orchestrate();
+        }
+    },
+
+    // ─── Stem Playback Controls ─────────────────────────────────
+    toggleStemVocal: () => {
+        vocalPlayer.toggle();
+        set({
+            stemVocalPlaying: vocalPlayer.isPlaying,
+            stemVocalPosition: vocalPlayer.getPosition(),
+        });
+    },
+
+    toggleStemInstrumental: () => {
+        instrumentalPlayer.toggle();
+        set({
+            stemInstrumentalPlaying: instrumentalPlayer.isPlaying,
+            stemInstrumentalPosition: instrumentalPlayer.getPosition(),
+        });
+    },
+
+    seekStemVocal: (position: number) => {
+        vocalPlayer.seekTo(position);
+        set({
+            stemVocalPosition: vocalPlayer.getPosition(),
+        });
+    },
+
+    seekStemInstrumental: (position: number) => {
+        instrumentalPlayer.seekTo(position);
+        set({
+            stemInstrumentalPosition: instrumentalPlayer.getPosition(),
+        });
+    },
+
+    loadStemPlayers: (trackId: string) => {
+        const state = get();
+        const stems = state.stemData[trackId];
+        if (!stems) return;
+
+        try {
+            vocalPlayer.loadStem(stems.vocalBuffer, stems.sampleRate);
+            instrumentalPlayer.loadStem(stems.instrumentalBuffer, stems.sampleRate);
+            set({
+                stemVocalPosition: 0,
+                stemInstrumentalPosition: 0,
+                stemVocalPlaying: false,
+                stemInstrumentalPlaying: false,
+                stemVocalDuration: vocalPlayer.duration,
+                stemInstrumentalDuration: instrumentalPlayer.duration,
+            });
+        } catch {
+            state.addInsight('warning', '⚠️ Could not load stem players');
         }
     },
 }));

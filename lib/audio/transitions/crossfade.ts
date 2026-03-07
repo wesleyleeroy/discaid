@@ -65,27 +65,43 @@ export const crossfadeStrategy: TransitionStrategy = {
     },
 
     generateEnvelopes(_context: TransitionContext, overlapDuration: number): AutomationEnvelope[] {
-        const steps = 20; // automation resolution
+        const steps = 24; // automation resolution
         const envelopes: AutomationEnvelope[] = [];
 
-        // ─── Gain A: Equal-power fade out ────────────────────────
+        // ─── Gain A: Hold → smooth power fade out ────────────────
+        // Holds at full for the first 15%, then equal-power fade
         const gainAPoints = [];
         for (let i = 0; i <= steps; i++) {
             const t = (i / steps) * overlapDuration;
             const progress = i / steps;
-            // Cosine curve for equal-power fade out
-            const value = Math.cos(progress * Math.PI * 0.5);
+            let value: number;
+            if (progress < 0.15) {
+                value = 1.0; // Hold at full while incoming establishes
+            } else {
+                // Equal-power fade over remaining 85%
+                const fadeProgress = (progress - 0.15) / 0.85;
+                value = Math.cos(fadeProgress * Math.PI * 0.5);
+            }
             gainAPoints.push({ time: t, value, curve: 'linear' as const });
         }
         envelopes.push({ parameter: 'gainA', points: gainAPoints });
 
-        // ─── Gain B: Equal-power fade in ─────────────────────────
+        // ─── Gain B: Early fade in → hold at full ────────────────
+        // Starts fading in at 10%, reaches full by 85%
         const gainBPoints = [];
         for (let i = 0; i <= steps; i++) {
             const t = (i / steps) * overlapDuration;
             const progress = i / steps;
-            // Sine curve for equal-power fade in
-            const value = Math.sin(progress * Math.PI * 0.5);
+            let value: number;
+            if (progress < 0.10) {
+                value = 0; // Silent at very start
+            } else if (progress < 0.85) {
+                // Equal-power fade in over the middle section
+                const fadeProgress = (progress - 0.10) / 0.75;
+                value = Math.sin(fadeProgress * Math.PI * 0.5);
+            } else {
+                value = 1.0; // Full for the tail end
+            }
             gainBPoints.push({ time: t, value, curve: 'linear' as const });
         }
         envelopes.push({ parameter: 'gainB', points: gainBPoints });

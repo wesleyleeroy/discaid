@@ -1,5 +1,5 @@
 /**
- * Playback Controls — Minimal controls: Skip, Pause/Resume, AI Toggle.
+ * Playback Controls — Minimal controls: Skip, Pause/Resume, Word Loop, AI Toggle.
  */
 
 'use client';
@@ -13,6 +13,7 @@ export default function PlaybackControls() {
     const skipTrack = useDJStore(s => s.skipTrack);
     const togglePause = useDJStore(s => s.togglePause);
     const toggleAI = useDJStore(s => s.toggleAI);
+    const triggerRewind = useDJStore(s => s.triggerRewind);
 
     return (
         <div className="flex items-center gap-3">
@@ -51,6 +52,19 @@ export default function PlaybackControls() {
                     <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />
                 </svg>
                 Skip
+            </button>
+
+            {/* Rewind */}
+            <button
+                onClick={triggerRewind}
+                disabled={!isPlaying}
+                className="btn-ghost flex items-center gap-2 text-sm"
+                title="Rewind ~0.75s (word effect)"
+            >
+                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z" />
+                </svg>
+                Rewind
             </button>
 
             {/* AI Toggle */}

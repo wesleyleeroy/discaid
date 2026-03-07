@@ -9,6 +9,11 @@ import { filterSweepStrategy } from './filter-sweep';
 import { echoOutStrategy } from './echo-out';
 import { bassSwapStrategy } from './bass-swap';
 import { energyRampStrategy } from './energy-ramp';
+import { dropSyncStrategy } from './drop-sync';
+import { vocalSustainStrategy } from './vocal-sustain';
+import { bedSwapStrategy } from './bed-swap';
+import { loopRollStrategy } from './loop-roll';
+import { vinylBrakeStrategy } from './vinyl-brake';
 
 /** All registered transition strategies */
 export const strategies: TransitionStrategy[] = [
@@ -17,6 +22,11 @@ export const strategies: TransitionStrategy[] = [
     echoOutStrategy,
     bassSwapStrategy,
     energyRampStrategy,
+    dropSyncStrategy,
+    vocalSustainStrategy,
+    bedSwapStrategy,
+    loopRollStrategy,
+    vinylBrakeStrategy,
 ];
 
 /** Get a strategy by type */
@@ -30,4 +40,9 @@ export {
     echoOutStrategy,
     bassSwapStrategy,
     energyRampStrategy,
+    dropSyncStrategy,
+    vocalSustainStrategy,
+    bedSwapStrategy,
+    loopRollStrategy,
+    vinylBrakeStrategy,
 };

@@ -37,6 +37,27 @@ export function executeTransition(
         resetDeckParams('A');
         resetDeckParams('B');
 
+        // Ensure outgoing deck is at full volume and incoming starts silent
+        // (envelopes will control the actual crossfade)
+        const outNodes = audioEngine.getDeck(outgoingDeck);
+        const inNodes = audioEngine.getDeck(incomingDeck);
+        if (outNodes) audioEngine.setParam(outNodes.inputGain.gain, 1);
+        if (inNodes) audioEngine.setParam(inNodes.inputGain.gain, 0);
+
+        // For drop-sync: incoming deck needs HPF mode (250Hz removes low mud)
+        if (plan.strategy === 'drop-sync') {
+            if (inNodes) {
+                inNodes.filter.type = 'highpass';
+            }
+        }
+
+        // For filter-sweep: outgoing deck needs HPF mode
+        if (plan.strategy === 'filter-sweep') {
+            if (outNodes) {
+                outNodes.filter.type = 'highpass';
+            }
+        }
+
         // If decks are swapped (B is outgoing), remap parameter names
         // so the envelopes target the correct physical deck
         const needsRemap = outgoingDeck === 'B';
@@ -83,6 +104,7 @@ function resetDeckParams(deck: 'A' | 'B'): void {
     const deckNodes = audioEngine.getDeck(deck);
     if (!deckNodes) return;
 
+    deckNodes.filter.type = 'lowpass'; // Reset filter mode (drop-sync uses highpass)
     audioEngine.setParam(deckNodes.eqLow.gain, 0);
     audioEngine.setParam(deckNodes.eqMid.gain, 0);
     audioEngine.setParam(deckNodes.eqHigh.gain, 0);
@@ -95,23 +117,47 @@ function resetDeckParams(deck: 'A' | 'B'): void {
 
 /**
  * Schedule an automation envelope on the appropriate audio parameter.
+ *
+ * Uses explicit setValueAtTime anchors between ramps to prevent
+ * the browser's automation timeline from getting confused by
+ * long chains of linearRampToValueAtTime calls.
  */
 function scheduleEnvelope(envelope: AutomationEnvelope): void {
     const param = resolveParam(envelope.parameter);
     if (!param) return;
+    const ctx = audioEngine.context;
+    if (!ctx) return;
 
     // Cancel any existing automation
-    audioEngine.cancelAutomation(param);
+    param.cancelScheduledValues(0);
 
-    // Set initial value
-    if (envelope.points.length > 0) {
-        audioEngine.setParam(param, envelope.points[0].value);
-    }
+    if (envelope.points.length === 0) return;
 
-    // Schedule subsequent points
+    const now = ctx.currentTime;
+
+    // Set the initial anchor
+    param.setValueAtTime(envelope.points[0].value, now);
+
+    // Schedule each subsequent point with an explicit anchor + ramp pair.
+    // This is more reliable than chaining many linearRamps, which can
+    // silently fail or produce unexpected results in some browsers.
     for (let i = 1; i < envelope.points.length; i++) {
+        const prev = envelope.points[i - 1];
         const point = envelope.points[i];
-        audioEngine.scheduleParam(param, point.value, point.time, point.curve || 'linear');
+        const absTime = now + point.time;
+
+        // Place an anchor at the previous point's time to guarantee
+        // the ramp starts from a known value
+        if (i > 1) {
+            param.setValueAtTime(prev.value, now + prev.time);
+        }
+
+        // Ramp to the new value
+        if (point.curve === 'exponential') {
+            param.exponentialRampToValueAtTime(Math.max(0.0001, point.value), absTime);
+        } else {
+            param.linearRampToValueAtTime(point.value, absTime);
+        }
     }
 }
 
@@ -142,6 +188,8 @@ function resolveParam(paramName: AutomationParameter): AudioParam | null {
         case 'delaySendB': return deckB.delaySend.gain;
         case 'delayTime': return audioEngine.getDelayNode()?.delayTime ?? null;
         case 'delayFeedback': return audioEngine.getDelayFeedback()?.gain ?? null;
+        case 'playbackRateA': return deckA.source?.playbackRate ?? null;
+        case 'playbackRateB': return deckB.source?.playbackRate ?? null;
         default: return null;
     }
 }
@@ -170,6 +218,8 @@ function remapParam(param: AutomationParameter): AutomationParameter {
         'reverbSendB': 'reverbSendA',
         'delaySendA': 'delaySendB',
         'delaySendB': 'delaySendA',
+        'playbackRateA': 'playbackRateB',
+        'playbackRateB': 'playbackRateA',
     };
     return swaps[param] ?? param;
 }

@@ -9,8 +9,12 @@ export type TransitionStrategyType =
     | 'filter-sweep'      // LPF/HPF sweep during transition
     | 'echo-out'          // Echo/delay tail on outgoing track
     | 'bass-swap'         // EQ bass attenuation swap
-    | 'energy-ramp';      // Energy build/drop transition
-
+    | 'energy-ramp'       // Energy build/drop transition
+    | 'drop-sync'         // High-energy drop-sync: layer incoming over build-up, slam at drop
+    | 'vocal-sustain'     // Vocal sustain bridge: outgoing vocal holds while incoming builds, hard cut
+    | 'bed-swap'          // Instrumental bed swap: blend incoming instrumental under outgoing vocals, switch
+    | 'loop-roll'         // Loop-roll build: shortening stutter effect building into a hard-cut drop
+    | 'vinyl-brake';      // Vinyl brake / power-off: playback rate drops to zero, then new track starts
 /** A scored candidate strategy from the planner */
 export interface TransitionCandidate {
     strategy: TransitionStrategyType;
@@ -51,7 +55,9 @@ export type AutomationParameter =
     | 'delaySendA'          // Outgoing delay send level
     | 'delaySendB'          // Incoming delay send level
     | 'delayTime'           // Delay time
-    | 'delayFeedback';      // Delay feedback amount
+    | 'delayFeedback'       // Delay feedback amount
+    | 'playbackRateA'       // Outgoing playback rate (1.0 = normal)
+    | 'playbackRateB';      // Incoming playback rate (1.0 = normal)
 
 /** Complete transition plan ready for execution */
 export interface TransitionPlan {

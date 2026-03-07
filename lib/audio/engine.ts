@@ -359,6 +359,38 @@ class AudioEngine {
     }
 
     /**
+     * Pause a deck — stops the source without triggering onended.
+     * Saves the current position so playDeck can resume from it.
+     * Unlike stopDeck, this won't fire end-of-track callbacks.
+     */
+    pauseDeck(deck: 'A' | 'B'): number {
+        const deckNodes = deck === 'A' ? this.deckA! : this.deckB!;
+        const pos = this.getDeckPosition(deck);
+
+        if (deckNodes?.source) {
+            try {
+                deckNodes.source.onended = null; // ← prevent orchestrator trigger
+                deckNodes.source.stop();
+            } catch {
+                // Source may already be stopped
+            }
+            deckNodes.source.disconnect();
+            deckNodes.source = null;
+        }
+
+        // Save position as offset so playDeck can resume
+        if (deck === 'A') {
+            this._state.deckAPlaying = false;
+            this.deckAOffset = pos;
+        } else {
+            this._state.deckBPlaying = false;
+            this.deckBOffset = pos;
+        }
+
+        return pos;
+    }
+
+    /**
      * Get the current playback position for a deck in seconds.
      */
     getDeckPosition(deck: 'A' | 'B'): number {
@@ -410,6 +442,13 @@ class AudioEngine {
         if (wasPlaying) {
             this.playDeck(deck, clampedTime);
         }
+    }
+    /**
+     * Rewind a deck by a given duration — simple seek back, song continues.
+     */
+    rewindSnippet(deck: 'A' | 'B', duration = 0.75): void {
+        const currentPos = this.getDeckPosition(deck);
+        this.seekDeck(deck, Math.max(0, currentPos - duration));
     }
 
     /**
