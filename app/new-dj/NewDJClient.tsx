@@ -6,7 +6,8 @@
  *   - Slot 1: "Up Next" — queued to play after current
  *   - Queue: additional songs waiting in line
  *
- * Upload .zip packages or stems folders (vocals.wav + instrumental.wav).
+ * Upload .zip packages or stems folders/loose files containing a vocal stem
+ * and an instrumental ("music") stem. .wav and .mp3 are both supported.
  * Files are decoded and waveforms generated instantly — no AI processing.
  */
 
@@ -17,6 +18,7 @@ import Link from 'next/link';
 import type { StemWaveform } from '@/lib/audio/stem-separator';
 import { useNewDJStore } from '@/stores/new-dj-store';
 import { createTransitionPlan, type TransitionPlan } from '@/lib/audio/dj-transition';
+import { detectBPM } from '@/lib/analysis/bpm';
 
 // ─── Waveform Generation ─────────────────────────────────────────
 function generateStereoWaveform(
@@ -198,10 +200,11 @@ function formatTime(s: number): string {
 interface SongSlotHandle {
     getPos: (stem: 'vocal' | 'instrumental') => number;
     isPlaying: (stem: 'vocal' | 'instrumental') => boolean;
-    startStemAt: (stem: 'vocal' | 'instrumental', offset: number) => void;
-    startStemFade: (stem: 'vocal' | 'instrumental', offset: number, startGain: number, endGain: number, duration: number) => void;
+    startStemAt: (stem: 'vocal' | 'instrumental', offset: number, rate?: number) => void;
+    startStemFade: (stem: 'vocal' | 'instrumental', offset: number, startGain: number, endGain: number, duration: number, rate?: number) => void;
     stopStemNow: (stem: 'vocal' | 'instrumental') => void;
     fadeGain: (stem: 'vocal' | 'instrumental', targetGain: number, duration: number) => void;
+    rampPlaybackRate: (stem: 'vocal' | 'instrumental', targetRate: number, duration: number) => void;
 }
 
 interface SongSlotProps {
@@ -250,6 +253,12 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
     const instrumentalStartTimeRef = useRef(0);
     const vocalPauseOffsetRef = useRef(storedSlot.vocalPos);
     const instrumentalPauseOffsetRef = useRef(storedSlot.instrumentalPos);
+    // Effective playback rate per stem. Used to convert real-time elapsed since
+    // start into buffer-position elapsed (which is what getPos must report so
+    // vocals can be started at the matching instrumental offset). Approximate
+    // during a rate ramp; updated to the target rate when the ramp completes.
+    const vocalRateRef = useRef(1);
+    const instrumentalRateRef = useRef(1);
     const animFrameRef = useRef(0);
     const songEndFiredRef = useRef(false);
     const autoPlayFiredRef = useRef(false);
@@ -265,7 +274,7 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
             const ctx = audioCtx.current;
             if (ctx) {
                 if (vocalSourceRef.current) {
-                    const livePos = vocalPauseOffsetRef.current + ctx.currentTime - vocalStartTimeRef.current;
+                    const livePos = vocalPauseOffsetRef.current + (ctx.currentTime - vocalStartTimeRef.current) * vocalRateRef.current;
                     vocalPauseOffsetRef.current = Math.max(0, livePos);
                     vocalSourceRef.current.onended = null;
                     try { vocalSourceRef.current.stop(); } catch { /* already stopped */ }
@@ -273,7 +282,7 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                     vocalSourceRef.current = null;
                 }
                 if (instrumentalSourceRef.current) {
-                    const livePos = instrumentalPauseOffsetRef.current + ctx.currentTime - instrumentalStartTimeRef.current;
+                    const livePos = instrumentalPauseOffsetRef.current + (ctx.currentTime - instrumentalStartTimeRef.current) * instrumentalRateRef.current;
                     instrumentalPauseOffsetRef.current = Math.max(0, livePos);
                     instrumentalSourceRef.current.onended = null;
                     try { instrumentalSourceRef.current.stop(); } catch { /* already stopped */ }
@@ -297,7 +306,7 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
             // Promoted! If instrumental is playing, start vocal at the same position
             const ctx = audioCtx.current;
             if (ctx && instrumentalSourceRef.current) {
-                const musicPos = instrumentalPauseOffsetRef.current + ctx.currentTime - instrumentalStartTimeRef.current;
+                const musicPos = instrumentalPauseOffsetRef.current + (ctx.currentTime - instrumentalStartTimeRef.current) * instrumentalRateRef.current;
                 const clampedPos = Math.max(0, Math.min(musicPos, song.data.duration));
 
                 // Only start vocal if it's not already playing
@@ -316,6 +325,7 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                         buf.copyToChannel(new Float32Array(bufData.right), 1);
                         const source = actx.createBufferSource();
                         source.buffer = buf;
+                        source.playbackRate.value = 1;
                         const gainNode = actx.createGain();
                         gainNode.gain.value = vocalVolume;
                         source.connect(gainNode).connect(actx.destination);
@@ -323,6 +333,7 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                         source.onended = () => {
                             setVocalPlaying(false);
                             vocalPauseOffsetRef.current = 0;
+                            vocalRateRef.current = 1;
                             setVocalPos(0);
                             if (!instrumentalSourceRef.current && onSongEndRef.current && !songEndFiredRef.current) {
                                 songEndFiredRef.current = true;
@@ -333,6 +344,7 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                         vocalGainRef.current = gainNode;
                         vocalStartTimeRef.current = actx.currentTime;
                         vocalPauseOffsetRef.current = clampedPos;
+                        vocalRateRef.current = 1;
                         setVocalPlaying(true);
                     }, 50);
                 }
@@ -348,10 +360,10 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
             const ctx = audioCtx.current;
             if (ctx && song) {
                 if (vocalPlaying) {
-                    setVocalPos(vocalPauseOffsetRef.current + ctx.currentTime - vocalStartTimeRef.current);
+                    setVocalPos(vocalPauseOffsetRef.current + (ctx.currentTime - vocalStartTimeRef.current) * vocalRateRef.current);
                 }
                 if (instrumentalPlaying) {
-                    setInstrumentalPos(instrumentalPauseOffsetRef.current + ctx.currentTime - instrumentalStartTimeRef.current);
+                    setInstrumentalPos(instrumentalPauseOffsetRef.current + (ctx.currentTime - instrumentalStartTimeRef.current) * instrumentalRateRef.current);
                 }
             }
             animFrameRef.current = requestAnimationFrame(tick);
@@ -383,7 +395,7 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
 
     // ── Start a stem ──
     const startStem = useCallback(
-        (stem: 'vocal' | 'instrumental', offset: number) => {
+        (stem: 'vocal' | 'instrumental', offset: number, rate: number = 1) => {
             if (!song) return;
             const ctx = audioCtx.current;
             if (!ctx) return;
@@ -395,6 +407,7 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
 
             const source = ctx.createBufferSource();
             source.buffer = buf;
+            source.playbackRate.value = rate;
             const gainNode = ctx.createGain();
             gainNode.gain.value = stem === 'vocal' ? vocalVolume : instrumentalVolume;
             source.connect(gainNode).connect(ctx.destination);
@@ -406,10 +419,12 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                 if (stem === 'vocal') {
                     setVocalPlaying(false);
                     vocalPauseOffsetRef.current = 0;
+                    vocalRateRef.current = 1;
                     setVocalPos(0);
                 } else {
                     setInstrumentalPlaying(false);
                     instrumentalPauseOffsetRef.current = 0;
+                    instrumentalRateRef.current = 1;
                     setInstrumentalPos(0);
                 }
                 // Check if both stems have ended (song is done)
@@ -426,11 +441,13 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                 vocalSourceRef.current = source;
                 vocalGainRef.current = gainNode;
                 vocalStartTimeRef.current = ctx.currentTime;
+                vocalRateRef.current = rate;
                 setVocalPlaying(true);
             } else {
                 instrumentalSourceRef.current = source;
                 instrumentalGainRef.current = gainNode;
                 instrumentalStartTimeRef.current = ctx.currentTime;
+                instrumentalRateRef.current = rate;
                 setInstrumentalPlaying(true);
             }
         },
@@ -442,15 +459,15 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
         getPos: (stem) => {
             const ctx = audioCtx.current;
             if (stem === 'vocal') {
-                if (vocalPlaying && ctx) return vocalPauseOffsetRef.current + ctx.currentTime - vocalStartTimeRef.current;
+                if (vocalPlaying && ctx) return vocalPauseOffsetRef.current + (ctx.currentTime - vocalStartTimeRef.current) * vocalRateRef.current;
                 return vocalPauseOffsetRef.current;
             } else {
-                if (instrumentalPlaying && ctx) return instrumentalPauseOffsetRef.current + ctx.currentTime - instrumentalStartTimeRef.current;
+                if (instrumentalPlaying && ctx) return instrumentalPauseOffsetRef.current + (ctx.currentTime - instrumentalStartTimeRef.current) * instrumentalRateRef.current;
                 return instrumentalPauseOffsetRef.current;
             }
         },
         isPlaying: (stem) => stem === 'vocal' ? vocalPlaying : instrumentalPlaying,
-        startStemAt: (stem, offset) => {
+        startStemAt: (stem, offset, rate = 1) => {
             if (stem === 'vocal' && vocalSourceRef.current) stopStem('vocal');
             if (stem === 'instrumental' && instrumentalSourceRef.current) stopStem('instrumental');
             // Set offset so the progress bar reflects the correct position
@@ -462,9 +479,9 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                 setInstrumentalPos(offset);
             }
             songEndFiredRef.current = false;
-            startStem(stem, offset);
+            startStem(stem, offset, rate);
         },
-        startStemFade: (stem, offset, startGain, endGain, duration) => {
+        startStemFade: (stem, offset, startGain, endGain, duration, rate = 1) => {
             if (stem === 'vocal' && vocalSourceRef.current) stopStem('vocal');
             if (stem === 'instrumental' && instrumentalSourceRef.current) stopStem('instrumental');
             // Set offset so the progress bar reflects the correct position
@@ -476,17 +493,20 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                 setInstrumentalPos(offset);
             }
             songEndFiredRef.current = false;
-            startStem(stem, offset);
+            startStem(stem, offset, rate);
             const gainNode = stem === 'vocal' ? vocalGainRef.current : instrumentalGainRef.current;
             if (gainNode && audioCtx.current) {
                 const now = audioCtx.current.currentTime;
                 gainNode.gain.cancelScheduledValues(now);
-                // Equal-power fade-in curve (sin)
+                // Quadratic ease-in (t²): the stem stays quiet through the
+                // first half of the fade and rises into full volume near
+                // the end, giving a "soft entrance" feel rather than the
+                // equal-power sin which gets to ~70% loud at the midpoint.
                 const steps = 128;
                 const curve = new Float32Array(steps);
                 for (let i = 0; i < steps; i++) {
                     const t = i / (steps - 1);
-                    curve[i] = startGain + (endGain - startGain) * Math.sin(t * Math.PI / 2);
+                    curve[i] = startGain + (endGain - startGain) * t * t;
                 }
                 gainNode.gain.setValueCurveAtTime(curve, now, duration);
             }
@@ -494,9 +514,9 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
         stopStemNow: (stem) => {
             const ctx = audioCtx.current;
             if (stem === 'vocal') {
-                if (ctx && vocalSourceRef.current) vocalPauseOffsetRef.current += ctx.currentTime - vocalStartTimeRef.current;
+                if (ctx && vocalSourceRef.current) vocalPauseOffsetRef.current += (ctx.currentTime - vocalStartTimeRef.current) * vocalRateRef.current;
             } else {
-                if (ctx && instrumentalSourceRef.current) instrumentalPauseOffsetRef.current += ctx.currentTime - instrumentalStartTimeRef.current;
+                if (ctx && instrumentalSourceRef.current) instrumentalPauseOffsetRef.current += (ctx.currentTime - instrumentalStartTimeRef.current) * instrumentalRateRef.current;
             }
             stopStem(stem);
         },
@@ -516,6 +536,47 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                 gainNode.gain.setValueCurveAtTime(curve, now, duration);
             }
         },
+        rampPlaybackRate: (stem, targetRate, duration) => {
+            const ctx = audioCtx.current;
+            if (!ctx) return;
+            const source = stem === 'vocal' ? vocalSourceRef.current : instrumentalSourceRef.current;
+            if (!source) return;
+
+            const startTimeRef = stem === 'vocal' ? vocalStartTimeRef : instrumentalStartTimeRef;
+            const pauseOffsetRef = stem === 'vocal' ? vocalPauseOffsetRef : instrumentalPauseOffsetRef;
+            const rateRef = stem === 'vocal' ? vocalRateRef : instrumentalRateRef;
+
+            const now = ctx.currentTime;
+            const oldRate = rateRef.current;
+
+            // Snapshot current buffer position so getPos stays consistent across
+            // the rate change. (During the ramp itself, getPos is approximate
+            // since we hold rate constant in JS; the AudioParam ramps smoothly.)
+            const currentBufferPos = pauseOffsetRef.current + (now - startTimeRef.current) * oldRate;
+            pauseOffsetRef.current = currentBufferPos;
+            startTimeRef.current = now;
+
+            source.playbackRate.cancelScheduledValues(now);
+            source.playbackRate.setValueAtTime(oldRate, now);
+            source.playbackRate.linearRampToValueAtTime(targetRate, now + duration);
+
+            // When the ramp completes, snapshot the integrated buffer position
+            // (avg-rate × duration) and switch JS state to the new constant rate.
+            const stem2 = stem; // capture for closure
+            setTimeout(() => {
+                const ctxNow = audioCtx.current;
+                if (!ctxNow) return;
+                const avgRate = (oldRate + targetRate) / 2;
+                pauseOffsetRef.current += duration * avgRate;
+                startTimeRef.current = ctxNow.currentTime;
+                rateRef.current = targetRate;
+                if (stem2 === 'vocal') {
+                    setVocalPos(pauseOffsetRef.current);
+                } else {
+                    setInstrumentalPos(pauseOffsetRef.current);
+                }
+            }, duration * 1000);
+        },
     }), [startStem, stopStem, vocalPlaying, instrumentalPlaying, audioCtx]);
 
     // ── Toggle a stem ──
@@ -525,11 +586,13 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
             const isPlaying = stem === 'vocal' ? vocalPlaying : instrumentalPlaying;
             const pauseRef = stem === 'vocal' ? vocalPauseOffsetRef : instrumentalPauseOffsetRef;
             const startRef = stem === 'vocal' ? vocalStartTimeRef : instrumentalStartTimeRef;
+            const rateRef = stem === 'vocal' ? vocalRateRef : instrumentalRateRef;
 
             if (isPlaying) {
                 const ctx = audioCtx.current;
-                if (ctx) pauseRef.current += ctx.currentTime - startRef.current;
+                if (ctx) pauseRef.current += (ctx.currentTime - startRef.current) * rateRef.current;
                 stopStem(stem);
+                rateRef.current = 1;
             } else {
                 songEndFiredRef.current = false;
                 startStem(stem, pauseRef.current);
@@ -546,13 +609,15 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
         if (anyPlaying) {
             if (vocalPlaying) {
                 const ctx = audioCtx.current;
-                if (ctx) vocalPauseOffsetRef.current += ctx.currentTime - vocalStartTimeRef.current;
+                if (ctx) vocalPauseOffsetRef.current += (ctx.currentTime - vocalStartTimeRef.current) * vocalRateRef.current;
                 stopStem('vocal');
+                vocalRateRef.current = 1;
             }
             if (instrumentalPlaying) {
                 const ctx = audioCtx.current;
-                if (ctx) instrumentalPauseOffsetRef.current += ctx.currentTime - instrumentalStartTimeRef.current;
+                if (ctx) instrumentalPauseOffsetRef.current += (ctx.currentTime - instrumentalStartTimeRef.current) * instrumentalRateRef.current;
                 stopStem('instrumental');
+                instrumentalRateRef.current = 1;
             }
         } else {
             startStem('vocal', vocalPauseOffsetRef.current);
@@ -597,7 +662,7 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
         if (instrumentalPlaying) {
             const ctx = audioCtx.current;
             if (ctx) {
-                musicPos = instrumentalPauseOffsetRef.current + ctx.currentTime - instrumentalStartTimeRef.current;
+                musicPos = instrumentalPauseOffsetRef.current + (ctx.currentTime - instrumentalStartTimeRef.current) * instrumentalRateRef.current;
             } else {
                 musicPos = instrumentalPos;
             }
@@ -655,6 +720,26 @@ const SongSlot = forwardRef<SongSlotHandle, SongSlotProps>(function SongSlot({
                     <span className="remover-results-icon">{slotIndex === 0 ? '▶' : '⏭'}</span>
                     <span style={{ opacity: 0.5, fontSize: '0.75rem', marginRight: 8 }}>{label}</span>
                     {song.name}
+                    {song.data.bpm !== undefined && (
+                        <span
+                            style={{
+                                marginLeft: 10,
+                                padding: '2px 9px',
+                                borderRadius: 999,
+                                background: 'linear-gradient(135deg, rgba(139,92,246,0.25), rgba(16,185,129,0.25))',
+                                border: '1px solid rgba(139,92,246,0.45)',
+                                color: '#e9d5ff',
+                                fontSize: '0.72rem',
+                                fontWeight: 700,
+                                letterSpacing: 0.5,
+                                fontVariantNumeric: 'tabular-nums',
+                                verticalAlign: 'middle',
+                            }}
+                            title="Detected BPM"
+                        >
+                            {Math.round(song.data.bpm)} BPM
+                        </span>
+                    )}
                 </div>
             </div>
 
@@ -783,6 +868,8 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
                         s1.data.vocalBuffer.left,
                         s1.data.vocalBuffer.right,
                         s1.data.sampleRate,
+                        s0.data.bpm,
+                        s1.data.bpm,
                     );
                     transitionPlanRef.current = plan;
                     setTransitionState('ready');
@@ -791,6 +878,8 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
                         fadeDuration: `${plan.crossfadeDuration.toFixed(1)}s`,
                         vocalSwitch: `${plan.vocalSwitchTime.toFixed(1)}s`,
                         song2Entry: `${plan.song2VocalEntry.toFixed(1)}s`,
+                        rateRatio: plan.song2RateRatio.toFixed(3),
+                        rampDuration: `${plan.song2RateRampDuration.toFixed(1)}s`,
                     });
                 } catch (err) {
                     console.error('[DJ] Failed to compute transition plan:', err);
@@ -834,10 +923,82 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
         setTransitionState('active');
         console.log('[DJ] Transition started — instrumental blend');
 
-        const totalDuration = plan.crossfadeDuration; // e.g. 8s
-        const fadeInDuration = totalDuration * 0.35;   // ~2.8s
-        const blendDuration = totalDuration * 0.25;    // ~2.0s
-        const fadeOutDuration = totalDuration * 0.40;  // ~3.2s
+        const totalDuration = plan.crossfadeDuration; // e.g. 10s
+        const s0Data = useNewDJStore.getState().slots[0];
+
+        // ── Re-anchor timing to the ACTUAL current song-1 position ──
+        // The plan was computed assuming the transition would start exactly
+        // when song 1 reached plan.crossfadeStart. If song 1 was already past
+        // that point at planning time (e.g., user added song 2 to the queue
+        // mid-playback past the planned crossfade), the monitor fires the
+        // trigger immediately and the plan's relative timings are stale.
+        // Use song 1's current position as the effective start instead, and
+        // re-pick song2VocalEntry so it actually lines up with where song 2
+        // will be when vocals switch.
+        const currentSong1Pos = slot0Ref.current.getPos('instrumental');
+        const effectiveStart = Math.max(plan.crossfadeStart, currentSong1Pos);
+        const expectedInstAtSwitch = Math.max(
+            0,
+            (plan.vocalSwitchTime - effectiveStart) * plan.song2RateRatio,
+        );
+        const TARGET_DELAY = 1.5;
+        const MAX_DELAY = 5;
+        const idealEntry = expectedInstAtSwitch + TARGET_DELAY * plan.song2RateRatio;
+        const song2DurationS = s1Data.song.data.duration;
+
+        // Pick a phrase boundary that's actually reachable from where song 2
+        // will be at vocal-switch time. Prefer phrases inside the [0, MAX]
+        // delay window; otherwise the closest available phrase. Never plan
+        // an entry past the song's end.
+        let effectiveVocalEntry: number;
+        const inWindow = plan.song2PhraseStarts.filter(
+            (p) =>
+                p >= expectedInstAtSwitch - 0.1 &&
+                p <= expectedInstAtSwitch + MAX_DELAY * plan.song2RateRatio,
+        );
+        if (inWindow.length > 0) {
+            effectiveVocalEntry = inWindow.reduce(
+                (best, p) => Math.abs(p - idealEntry) < Math.abs(best - idealEntry) ? p : best,
+                inWindow[0],
+            );
+        } else {
+            const next = plan.song2PhraseStarts.find((p) => p >= expectedInstAtSwitch);
+            effectiveVocalEntry = next ?? idealEntry;
+        }
+        effectiveVocalEntry = Math.max(0, Math.min(effectiveVocalEntry, song2DurationS - 0.5));
+
+        if (effectiveStart !== plan.crossfadeStart || effectiveVocalEntry !== plan.song2VocalEntry) {
+            console.log(
+                `[DJ] Re-anchored timing: crossfadeStart ${plan.crossfadeStart.toFixed(1)}→${effectiveStart.toFixed(1)}, ` +
+                `song2VocalEntry ${plan.song2VocalEntry.toFixed(2)}→${effectiveVocalEntry.toFixed(2)}`,
+            );
+        }
+
+        // Both instrumentals sit at this fraction of their native volume during
+        // the held-blend window. 0.75² + 0.75² ≈ 1.13, so combined loudness is
+        // close to a single track at full — "decent volume, both playing"
+        // without sounding stacked or muddy.
+        const BLEND_FRACTION = 0.75;
+        const song2BlendVolume = s1Data.instrumentalVolume * BLEND_FRACTION;
+        const song1BlendVolume = s0Data.instrumentalVolume * BLEND_FRACTION;
+
+        // Phase budget for a 14-second crossfade:
+        //   t=0.0   ─────────────► song 2 fades in 0 → blend (3.0s, quadratic)
+        //   t=3.0   ─────────────► song 1 ducks full → blend (1.0s)
+        //   t=4.0   ─── HELD ────► both at blend volume (3.0s)
+        //   t=7.0   ─── CROSS ───► song 1: blend → 0      (6.5s)  ◀─ extended
+        //                          song 2: blend → full   (6.5s)  ◀─ extended
+        //   t=13.5  ─────────────► song 2 alone at full
+        //   t=14.0  ─────────────► song 1 source stopped
+        //
+        // The cross-trade (Phase 4) is now 6.5s — both instrumentals stay
+        // audible while their volumes invert, which is the long blended
+        // hand-off the user wanted.
+        const fadeInDuration       = (totalDuration * 3) / 14;   // 3.0s
+        const enterBlendDelay      = (totalDuration * 3) / 14;   // 3.0s — when song 1 starts ducking
+        const enterBlendDuration   = (totalDuration * 1) / 14;   // 1.0s — song 1's duck time
+        const exitBlendDelay       = (totalDuration * 7) / 14;   // 7.0s — when both start their final ramps
+        const exitBlendDuration    = (totalDuration * 6.5) / 14; // 6.5s — song 1 fade-out / song 2 rise-to-full
 
         // We wrap the two independent timelines (instrumental blend & vocal switch)
         // in Promises so we can wait for BOTH to finish before advancing the queue.
@@ -847,28 +1008,53 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
 
         // Timeline 1: Instrumental Blend
         const instrumentalPromise = new Promise<void>((resolve) => {
-            // Phase 1: Start song 2's instrumental, fade in to full
+            // ── Phase 1: song 2 enters quietly and rises to blend volume ──
+            // Quadratic ease-in (handled inside startStemFade) keeps the
+            // entrance soft. We deliberately stop at BLEND volume, not full,
+            // so that during the held-blend window the two tracks balance.
             slot1Ref.current?.startStemFade(
                 'instrumental',
                 0,
                 0,
-                s1Data.instrumentalVolume,
+                song2BlendVolume,
                 fadeInDuration,
+                plan.song2RateRatio,
             );
 
-            console.log(`[DJ] Phase 1: Song 2 instrumental fading in (${fadeInDuration.toFixed(1)}s)`);
-            console.log(`[DJ] Phase 2: Both instrumentals blending (${blendDuration.toFixed(1)}s)`);
-            console.log(`[DJ] Phase 3: Song 1 instrumental fading out (${fadeOutDuration.toFixed(1)}s)`);
+            console.log(
+                `[DJ] Phase 1 (0–${fadeInDuration.toFixed(1)}s): song 2 fading in 0 → ${song2BlendVolume.toFixed(2)}`,
+            );
 
-            // Phase 3: After blend window, fade out song 1's instrumental
-            const fadeOutDelay = fadeInDuration + blendDuration;
-            const fadeOutTimer = setTimeout(() => {
-                console.log('[DJ] Phase 3: Fading out song 1 instrumental');
-                slot0Ref.current?.fadeGain('instrumental', 0, fadeOutDuration);
-            }, fadeOutDelay * 1000);
-            transitionTimersRef.current.push(fadeOutTimer);
+            // ── Phase 2: song 1 ducks from full → blend volume ──
+            // By the time this completes, both instrumentals are sitting at
+            // the same blend level, which is the held-blend the user wanted.
+            const enterBlendTimer = setTimeout(() => {
+                console.log(`[DJ] Phase 2: song 1 ducking → ${song1BlendVolume.toFixed(2)} over ${enterBlendDuration.toFixed(1)}s`);
+                slot0Ref.current?.fadeGain('instrumental', song1BlendVolume, enterBlendDuration);
+            }, enterBlendDelay * 1000);
+            transitionTimersRef.current.push(enterBlendTimer);
 
-            // Finish: Stop song 1's instrumental source after fade out completely finishes
+            // ── Phase 3: HELD BLEND ── both stems sit at blend volume.
+            // No automation scheduled; the gain nodes just hold their levels
+            // until Phase 4 fires. This is the audible "playing together"
+            // window (~3s by default).
+            const heldBlendStart = enterBlendDelay + enterBlendDuration;
+            const heldBlendDuration = exitBlendDelay - heldBlendStart;
+            console.log(
+                `[DJ] Phase 3 (${heldBlendStart.toFixed(1)}–${exitBlendDelay.toFixed(1)}s): held blend, both at ~${BLEND_FRACTION.toFixed(2)} for ${heldBlendDuration.toFixed(1)}s`,
+            );
+
+            // ── Phase 4: song 1 fades out, song 2 rises to full ──
+            const exitBlendTimer = setTimeout(() => {
+                console.log(
+                    `[DJ] Phase 4: song 1 → 0 / song 2 → ${s1Data.instrumentalVolume.toFixed(2)} over ${exitBlendDuration.toFixed(1)}s`,
+                );
+                slot0Ref.current?.fadeGain('instrumental', 0, exitBlendDuration);
+                slot1Ref.current?.fadeGain('instrumental', s1Data.instrumentalVolume, exitBlendDuration);
+            }, exitBlendDelay * 1000);
+            transitionTimersRef.current.push(exitBlendTimer);
+
+            // ── Phase 5: stop song 1's instrumental source ──
             const stopOldTimer = setTimeout(() => {
                 slot0Ref.current?.stopStemNow('instrumental');
                 resolve(); // Instrumental transition is done
@@ -878,31 +1064,56 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
 
         // Timeline 2: Vocal Switch
         const vocalPromise = new Promise<void>((resolve) => {
-            const vocalDelay = Math.max(0, (plan.vocalSwitchTime - plan.crossfadeStart)) * 1000;
+            // Use the re-anchored effectiveStart, NOT plan.crossfadeStart.
+            // This keeps the vocal-switch timer in sync with the actual song-1
+            // playback position even if the plan was stale.
+            const vocalDelay = Math.max(0, (plan.vocalSwitchTime - effectiveStart)) * 1000;
             const vocalTimer = setTimeout(() => {
-                console.log('[DJ] Song 1 vocals ended — waiting for song 2 phrase start...');
+                console.log('[DJ] Song 1 vocals ended — waiting for song 2 vocal entry...');
                 slot0Ref.current?.stopStemNow('vocal');
 
+                // Wait for song 2's instrumental to reach the chosen phrase
+                // boundary, then start vocals at the live (rate-aware) buffer
+                // position so they stay locked to the instrumental.
+                //
+                // instPos and target are BUFFER offsets; waitSec is real time
+                // (buffer advances `rateRatio` per real second).
                 const instPos = slot1Ref.current?.getPos('instrumental') ?? 0;
-                const nextPhrase = plan.song2PhraseStarts.find((t) => t >= instPos);
+                const target = effectiveVocalEntry;
+                const rate = Math.max(plan.song2RateRatio, 1e-3);
+                const waitSec = Math.max(0, (target - instPos) / rate);
+                // Cap is generous (15 s) so unusual plans still ultimately
+                // start vocals — if we hit the cap, vocals will start at the
+                // live position rather than the targeted phrase, which is
+                // still better than no vocals at all.
+                const MAX_WAIT_SEC = 15;
+                const cappedWait = Math.min(waitSec, MAX_WAIT_SEC);
 
-                if (nextPhrase !== undefined && nextPhrase > instPos) {
-                    const waitMs = (nextPhrase - instPos) * 1000;
-                    console.log(`[DJ] Waiting ${(waitMs / 1000).toFixed(1)}s for next phrase at ${nextPhrase.toFixed(1)}s`);
+                console.log(
+                    `[DJ] Vocal entry at song-2 offset ${target.toFixed(2)}s ` +
+                    `(waiting ${cappedWait.toFixed(2)}s from current ${instPos.toFixed(2)}s, rate ${rate.toFixed(3)})`,
+                );
 
-                    const phraseTimer = setTimeout(() => {
-                        console.log('[DJ] Song 2 vocals starting at phrase!');
-                        const livePos = slot1Ref.current?.getPos('instrumental') ?? nextPhrase;
-                        slot1Ref.current?.startStemAt('vocal', livePos);
-                        resolve(); // Vocal switch is done
-                    }, waitMs);
-                    transitionTimersRef.current.push(phraseTimer);
-                } else {
-                    console.log('[DJ] No future phrase found, starting vocals immediately');
-                    const livePos = slot1Ref.current?.getPos('instrumental') ?? plan.song2VocalEntry;
-                    slot1Ref.current?.startStemAt('vocal', livePos);
-                    resolve(); // Vocal switch is done
-                }
+                const phraseTimer = setTimeout(() => {
+                    // Read the instrumental's true buffer position (rate-aware)
+                    // so the vocal source starts at the matching offset and
+                    // stays in sync with the instrumental.
+                    const livePos = slot1Ref.current?.getPos('instrumental') ?? target;
+                    const safeLivePos = Math.max(0, Math.min(livePos, song2DurationS - 0.5));
+                    // Vocals must enter at the SAME rate as the instrumental
+                    // (currently plan.song2RateRatio); otherwise they desync.
+                    slot1Ref.current?.startStemAt('vocal', safeLivePos, plan.song2RateRatio);
+                    console.log(`[DJ] Song 2 vocals started at offset ${safeLivePos.toFixed(2)}s`);
+                    // Now ramp BOTH stems back to 1.0 over the planned ramp
+                    // window. They share the same rate envelope so they stay
+                    // locked together while the tempo settles to native.
+                    if (plan.song2RateRatio !== 1) {
+                        slot1Ref.current?.rampPlaybackRate('instrumental', 1, plan.song2RateRampDuration);
+                        slot1Ref.current?.rampPlaybackRate('vocal', 1, plan.song2RateRampDuration);
+                    }
+                    resolve();
+                }, cappedWait * 1000);
+                transitionTimersRef.current.push(phraseTimer);
             }, vocalDelay);
             transitionTimersRef.current.push(vocalTimer);
         });
@@ -965,6 +1176,22 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
         const instrumentalWf = generateStereoWaveform(instLeft, instRight, numBins);
         const duration = Math.max(vocalAudio.duration, instrumentalAudio.duration);
 
+        // BPM is detected from the instrumental (cleaner beats than vocals).
+        // Confidence below ~0.25 is unreliable enough that we'd rather skip
+        // tempo-matching than match to the wrong tempo.
+        let detectedBPM: number | undefined;
+        try {
+            const bpmResult = detectBPM(instrumentalAudio);
+            if (bpmResult.confidence >= 0.25) {
+                detectedBPM = bpmResult.bpm;
+                console.log(`[DJ] "${songName}" BPM ${bpmResult.bpm} (conf ${bpmResult.confidence.toFixed(2)})`);
+            } else {
+                console.log(`[DJ] "${songName}" BPM detection low-confidence; will play at native rate`);
+            }
+        } catch (err) {
+            console.warn('[DJ] BPM detection failed:', err);
+        }
+
         store.addSong({
             name: songName,
             data: {
@@ -974,6 +1201,7 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
                 instrumentalBuffer: { left: instLeft, right: instRight },
                 duration,
                 sampleRate: vocalAudio.sampleRate,
+                bpm: detectedBPM,
             },
         });
     }, [audioCtx, store]);
@@ -987,12 +1215,17 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
             const JSZip = (await import('jszip')).default;
             const zip = await JSZip.loadAsync(file);
 
-            const vocalsFile = zip.file('vocals.wav');
-            const instrumentalFile = zip.file('instrumental.wav');
+            const audioEntries = Object.values(zip.files).filter(
+                (f) => !f.dir && /\.(wav|mp3)$/i.test(f.name)
+            );
+            const vocalsFile = audioEntries.find((f) => /vocal/i.test(f.name));
+            const instrumentalFile = audioEntries.find(
+                (f) => /(instrumental|music|accompaniment|backing|karaoke|no[_ -]?vocal)/i.test(f.name)
+            );
             const metadataFile = zip.file('metadata.json');
 
             if (!vocalsFile || !instrumentalFile) {
-                throw new Error('Invalid stems package. Expected vocals.wav and instrumental.wav inside the ZIP.');
+                throw new Error('Invalid stems package. Expected a vocal and an instrumental/music file (.wav or .mp3) inside the ZIP.');
             }
 
             let songName = file.name.replace(/\.zip$/, '').replace(/_stems$/, '');
@@ -1024,15 +1257,30 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
         setIsLoading(true);
 
         try {
-            const vocalFile = files.find(f => f.name === 'vocals.wav');
-            const instFile = files.find(f => f.name === 'instrumental.wav');
-            const metaFile = files.find(f => f.name === 'metadata.json');
+            const audioFiles = files.filter((f) => /\.(wav|mp3)$/i.test(f.name));
+            let vocalFile = audioFiles.find((f) => /vocal/i.test(f.name));
+            let instFile = audioFiles.find(
+                (f) => /(instrumental|music|accompaniment|backing|karaoke|no[_ -]?vocal)/i.test(f.name)
+            );
 
-            if (!vocalFile || !instFile) {
-                throw new Error('Could not find vocals.wav and instrumental.wav.');
+            // Fallback: if exactly two audio files were dropped and only one matched,
+            // assume the unmatched one is the other stem.
+            if (audioFiles.length === 2 && (!vocalFile || !instFile)) {
+                if (vocalFile && !instFile) instFile = audioFiles.find((f) => f !== vocalFile);
+                else if (instFile && !vocalFile) vocalFile = audioFiles.find((f) => f !== instFile);
             }
 
-            let songName = 'Untitled';
+            const metaFile = files.find((f) => f.name === 'metadata.json');
+
+            if (!vocalFile || !instFile) {
+                throw new Error('Could not identify vocal + instrumental files. Name them so one contains "vocal" and the other contains "music" or "instrumental" (.wav or .mp3).');
+            }
+
+            const derived = (vocalFile.name || instFile.name)
+                .replace(/\.(wav|mp3)$/i, '')
+                .split('(')[0]
+                .trim();
+            let songName = derived || 'Untitled';
             if (metaFile) {
                 try {
                     const metaText = await metaFile.text();
@@ -1064,12 +1312,13 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
             const zipFile = fileArray.find(f => f.name.toLowerCase().endsWith('.zip'));
             if (zipFile) { processZip(zipFile); return; }
 
-            const relevantFiles = fileArray.filter(f =>
-                f.name.toLowerCase().endsWith('.wav') || f.name.toLowerCase() === 'metadata.json'
-            );
+            const relevantFiles = fileArray.filter(f => {
+                const n = f.name.toLowerCase();
+                return n.endsWith('.wav') || n.endsWith('.mp3') || n === 'metadata.json';
+            });
             if (relevantFiles.length > 0) { processFiles(relevantFiles); return; }
 
-            setError('Please upload a .zip stems package, select files, or drop a folder containing vocals.wav + instrumental.wav.');
+            setError('Please upload a .zip stems package or two audio files (.wav or .mp3) — one named with "vocal", the other with "music"/"instrumental".');
         },
         [processZip, processFiles]
     );
@@ -1144,7 +1393,7 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
             </div>
             {!hasSongs && !folderDropHighlight && (
                 <div className="remover-upload-hint">
-                    Drag & drop a stems folder or .zip here, or select files below
+                    Drag & drop a stems folder, .zip, or a vocal + music pair (.wav / .mp3) — or select files below
                 </div>
             )}
             {folderDropHighlight && (
@@ -1176,7 +1425,7 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
     // ────────────────────────── RENDER ──────────────────────────────
     return (
         <div className="stem-player-container" style={{ maxWidth: 900, margin: '0 auto', width: '100%' }}>
-            <input ref={fileInputRef} type="file" multiple hidden accept=".zip,.wav,.json" onChange={(e) => { handleInput(e.target.files); e.target.value = ''; }} />
+            <input ref={fileInputRef} type="file" multiple hidden accept=".zip,.wav,.mp3,audio/wav,audio/mpeg,.json" onChange={(e) => { handleInput(e.target.files); e.target.value = ''; }} />
 
             {/* Upload zone when no songs */}
             {stage === 'idle' && !isLoading && (
@@ -1265,6 +1514,23 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
                                         <span style={{ opacity: 0.4, fontSize: '0.7rem', width: 20, textAlign: 'center' }}>{i + 1}</span>
                                         <span>🎵</span>
                                         {qSong.name}
+                                        {qSong.data.bpm !== undefined && (
+                                            <span
+                                                style={{
+                                                    padding: '1px 7px',
+                                                    borderRadius: 999,
+                                                    background: 'rgba(139,92,246,0.18)',
+                                                    border: '1px solid rgba(139,92,246,0.35)',
+                                                    color: '#c4b5fd',
+                                                    fontSize: '0.68rem',
+                                                    fontWeight: 700,
+                                                    fontVariantNumeric: 'tabular-nums',
+                                                }}
+                                                title="Detected BPM"
+                                            >
+                                                {Math.round(qSong.data.bpm)} BPM
+                                            </span>
+                                        )}
                                         <span style={{ opacity: 0.4, fontSize: '0.75rem' }}>{formatTime(qSong.data.duration)}</span>
                                     </div>
                                     <button onClick={() => store.removeFromQueue(i)} style={{ background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 6, color: '#fca5a5', fontSize: '0.7rem', padding: '2px 8px', cursor: 'pointer' }}>✕</button>
