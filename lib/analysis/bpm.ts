@@ -1,16 +1,20 @@
 /**
- * BPM Detection using Autocorrelation.
+ * BPM Detection using comb-filtered autocorrelation of an onset envelope.
  *
  * Algorithm:
- * 1. Compute onset strength envelope from energy differences
- * 2. Apply autocorrelation to find periodic patterns
- * 3. Map peak lag positions to BPM values
- * 4. Score confidence based on peak prominence
- *
- * DSP Note: We use half-wave rectified spectral flux for onset detection,
- * which captures transient energy increases (attacks/onsets) while ignoring
- * energy decreases (decays). The autocorrelation of this signal reveals
- * the dominant periodicity, which corresponds to the tempo.
+ * 1. Compute log-magnitude energy on overlapping ~23ms frames (compresses
+ *    dynamic range so quieter beats don't get drowned by sustained vocals).
+ * 2. Take half-wave rectified first differences for an onset envelope, then
+ *    subtract a local moving mean to suppress non-percussive content.
+ * 3. Compute autocorrelation across a wide lag range — far enough that we
+ *    can sum harmonic peaks (lag, 2·lag, 3·lag, …) for any candidate tempo.
+ * 4. For each candidate BPM at 0.1 BPM resolution, score it with a comb
+ *    filter that adds the autocorrelation at its first K harmonic lags.
+ *    This is what disambiguates octave errors: a true 120 BPM song scores
+ *    higher than 60 BPM because peaks at 0.5s, 1.0s, 1.5s, 2.0s, ... all
+ *    align, whereas testing 60 BPM only catches every other peak.
+ * 5. Apply only a very mild prior toward the 70–180 BPM range — the comb
+ *    filter does the heavy lifting, so we don't need an aggressive bias.
  */
 
 import { BPM_MIN, BPM_MAX, BPM_ANALYSIS_DURATION } from '@/lib/utils/constants';
@@ -44,11 +48,16 @@ export function detectBPM(audioBuffer: AudioBuffer): BPMResult {
         }
     }
 
-    // Step 1: Compute onset strength envelope
-    // Use short energy windows and half-wave rectify the difference
-    const windowSize = Math.floor(sampleRate * 0.01); // 10ms windows
-    const hopSize = Math.floor(windowSize / 2);        // 50% overlap
-    const numWindows = Math.floor((maxSamples - windowSize) / hopSize);
+    // ── Step 1: log-magnitude energy envelope ─────────────────────
+    // Larger frames (~23 ms) give smoother envelopes than the prior 10 ms
+    // and don't fire on transient noise inside a single beat.
+    const windowSize = 1024;
+    const hopSize = 512;
+    if (maxSamples < windowSize * 4) {
+        // Too short to analyze reliably
+        return { bpm: 120, confidence: 0, beatGrid: [], downbeats: [] };
+    }
+    const numWindows = Math.floor((maxSamples - windowSize) / hopSize) + 1;
 
     const energy = new Float32Array(numWindows);
     for (let i = 0; i < numWindows; i++) {
@@ -58,82 +67,106 @@ export function detectBPM(audioBuffer: AudioBuffer): BPMResult {
             const s = channelData[start + j];
             sum += s * s;
         }
-        energy[i] = Math.sqrt(sum / windowSize); // RMS per window
+        // log(1 + meanSquare) compresses dynamics so a soft kick contributes
+        // similarly to a loud snare — important for accurate onset rate.
+        energy[i] = Math.log1p(sum / windowSize);
     }
 
-    // Half-wave rectified first difference (onset strength)
-    const onsetStrength = new Float32Array(numWindows - 1);
+    // ── Step 2: half-wave rectified differential, then subtract local mean ─
+    const rawOnsets = new Float32Array(numWindows - 1);
     for (let i = 1; i < numWindows; i++) {
-        onsetStrength[i - 1] = Math.max(0, energy[i] - energy[i - 1]);
+        rawOnsets[i - 1] = Math.max(0, energy[i] - energy[i - 1]);
+    }
+    // Subtracting a moving average suppresses slow-varying baseline (sustained
+    // pads/vocals) while preserving sharp transients (drums).
+    const onsetStrength = new Float32Array(rawOnsets.length);
+    const smoothRadius = 8; // ±~93 ms
+    for (let i = 0; i < rawOnsets.length; i++) {
+        let s = 0, c = 0;
+        const lo = Math.max(0, i - smoothRadius);
+        const hi = Math.min(rawOnsets.length - 1, i + smoothRadius);
+        for (let j = lo; j <= hi; j++) { s += rawOnsets[j]; c++; }
+        onsetStrength[i] = Math.max(0, rawOnsets[i] - s / c);
     }
 
-    // Step 2: Autocorrelation in BPM range
+    // ── Step 3: autocorrelation across a WIDE lag range ───────────
+    // Wide enough to fit K harmonics at the slowest tempo we'd consider.
     const onsetRate = sampleRate / hopSize; // onsets per second
-    const minLag = Math.floor((onsetRate * 60) / BPM_MAX);
-    const maxLag = Math.floor((onsetRate * 60) / BPM_MIN);
-    const lagRange = maxLag - minLag + 1;
+    const K = 5; // number of harmonic peaks to comb
+    const maxLagSec = (60 / BPM_MIN) * K;   // e.g. 5 s for K=5, BPM_MIN=60
+    const maxLagSamples = Math.min(
+        onsetStrength.length - 1,
+        Math.floor(maxLagSec * onsetRate),
+    );
 
-    const autocorrelation = new Float32Array(lagRange);
-    const n = onsetStrength.length;
-
-    for (let lag = minLag; lag <= maxLag; lag++) {
+    const autocorr = new Float32Array(maxLagSamples + 1);
+    for (let lag = 1; lag <= maxLagSamples; lag++) {
+        const count = onsetStrength.length - lag;
+        if (count <= 0) break;
         let sum = 0;
-        const count = n - lag;
         for (let i = 0; i < count; i++) {
             sum += onsetStrength[i] * onsetStrength[i + lag];
         }
-        autocorrelation[lag - minLag] = sum / count;
+        autocorr[lag] = sum / count;
     }
 
-    // Step 3: Find peaks in autocorrelation
-    // Apply perceptual weighting to prefer common tempos (90-150 BPM range)
-    const weighted = new Float32Array(lagRange);
-    for (let i = 0; i < lagRange; i++) {
-        const lag = i + minLag;
-        const bpm = (onsetRate * 60) / lag;
-        // Gaussian weighting centered at 120 BPM, sigma = 30
-        const weight = Math.exp(-0.5 * Math.pow((bpm - 120) / 30, 2));
-        weighted[i] = autocorrelation[i] * (0.5 + 0.5 * weight);
-    }
+    // ── Step 4: comb-filter score for every candidate BPM ─────────
+    let bestBPM = 120;
+    let bestScore = -Infinity;
+    let scoreSum = 0;
+    let scoreCount = 0;
 
-    // Find the top peak
-    let maxVal = -Infinity;
-    let maxIdx = 0;
-    for (let i = 0; i < lagRange; i++) {
-        if (weighted[i] > maxVal) {
-            maxVal = weighted[i];
-            maxIdx = i;
+    for (let bpm = BPM_MIN; bpm <= BPM_MAX; bpm += 0.1) {
+        const lagF = (60 / bpm) * onsetRate;
+        let score = 0;
+        let weightSum = 0;
+        for (let k = 1; k <= K; k++) {
+            const harmonicLag = k * lagF;
+            const intLag = Math.floor(harmonicLag);
+            if (intLag < 1 || intLag + 1 > maxLagSamples) break;
+            const frac = harmonicLag - intLag;
+            const ac = autocorr[intLag] * (1 - frac) + autocorr[intLag + 1] * frac;
+            // 1/√k weighting: the fundamental matters most but harmonics
+            // still contribute meaningfully.
+            const w = 1 / Math.sqrt(k);
+            score += ac * w;
+            weightSum += w;
+        }
+        if (weightSum > 0) score /= weightSum;
+
+        // Very mild perceptual nudge — broad, gentle. Avoids forcing 120 BPM
+        // on songs that genuinely sit at 80 or 160.
+        const bias = 1 + 0.04 * Math.exp(-Math.pow((bpm - 125) / 60, 2));
+        score *= bias;
+
+        scoreSum += score;
+        scoreCount++;
+        if (score > bestScore) {
+            bestScore = score;
+            bestBPM = bpm;
         }
     }
 
-    const bestLag = maxIdx + minLag;
-    let bpm = (onsetRate * 60) / bestLag;
+    // Round to nearest 0.1
+    const bpm = Math.round(bestBPM * 10) / 10;
 
-    // Step 4: Confidence from peak-to-mean ratio
-    let mean = 0;
-    for (let i = 0; i < lagRange; i++) {
-        mean += autocorrelation[i];
-    }
-    mean /= lagRange;
+    // Confidence: how much the winning BPM exceeds the mean score across
+    // all candidates. Comb-filter prominence is a good proxy for tempo
+    // clarity.
+    const meanScore = scoreSum / Math.max(1, scoreCount);
+    const confidence = Math.min(
+        1,
+        Math.max(0, meanScore > 0 ? (bestScore / meanScore - 1) * 0.6 : 0),
+    );
 
-    const rawConfidence = mean > 0 ? autocorrelation[maxIdx] / (mean * 2.5) : 0;
-    const confidence = Math.min(1, Math.max(0, rawConfidence));
-
-    // Round BPM to nearest 0.1
-    bpm = Math.round(bpm * 10) / 10;
-
-    // Ensure BPM is in a standard range (double/halve if needed)
-    if (bpm < BPM_MIN) bpm *= 2;
-    if (bpm > BPM_MAX) bpm /= 2;
-
-    // Step 5: Generate beat grid from detected BPM
-    const beatInterval = 60 / bpm; // seconds per beat
+    // ── Step 5: beat grid using the (now-accurate) BPM ────────────
+    const beatInterval = 60 / bpm;
     const totalDuration = audioBuffer.duration;
     const { beatGrid, downbeats } = generateBeatGrid(
         onsetStrength,
         onsetRate,
         beatInterval,
-        totalDuration
+        totalDuration,
     );
 
     return { bpm, confidence, beatGrid, downbeats };

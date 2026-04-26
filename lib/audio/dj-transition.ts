@@ -22,6 +22,22 @@ export interface TransitionPlan {
     vocalSwitchTime: number;    // when to stop song 1's vocals (seconds into song 1)
     song2VocalEntry: number;    // fallback entry point for song 2's vocal
     song2PhraseStarts: number[]; // all phrase start timestamps in song 2's vocals (seconds)
+    song2RateRatio: number;       // playback-rate multiplier for song 2 during the crossfade (1 = no change)
+    song2RateRampDuration: number; // seconds over which song 2 ramps back to 1.0 once its vocals enter
+}
+
+/**
+ * Compute the playback-rate ratio to apply to song 2 so its tempo matches
+ * song 1 during the crossfade. Falls back to 1.0 (no change) if either BPM
+ * is unknown. Tries half/double tempo (a common DJ trick) before clamping.
+ */
+function computeRateRatio(bpm1?: number, bpm2?: number): number {
+    if (!bpm1 || !bpm2 || !isFinite(bpm1) || !isFinite(bpm2)) return 1;
+    let r = bpm1 / bpm2;
+    if (r > 1.4) r /= 2;
+    else if (r < 0.7) r *= 2;
+    const MAX_STRETCH = 0.18; // ±18%, beyond this pitch shift is too obvious
+    return Math.max(1 - MAX_STRETCH, Math.min(1 + MAX_STRETCH, r));
 }
 
 /**
@@ -142,24 +158,31 @@ export function findNearestPhraseStart(
 
 /**
  * Find ALL phrase start timestamps in a vocal track.
- * Returns sorted array of times (seconds) where energy rises
- * from below the silence threshold to above it.
+ *
+ * Returns the END of each significant silence — i.e., the moment vocals
+ * re-enter after a real pause. By requiring a minimum preceding silence,
+ * we filter out mid-sentence dips and only return points that sound like
+ * the start of a new line/sentence/section.
  */
 export function findAllPhraseStarts(
     energy: Float32Array,
     frameRate: number,
+    minPrecedingSilenceSeconds: number = 0.4,
 ): number[] {
-    let sum = 0;
-    for (let i = 0; i < energy.length; i++) sum += energy[i];
-    const mean = sum / Math.max(1, energy.length);
-    const threshold = mean * 0.1;
+    const pauses = findVocalPauses(energy, frameRate, minPrecedingSilenceSeconds);
+    const starts = pauses.map((p) => p.end);
 
-    const starts: number[] = [];
-    for (let i = 1; i < energy.length; i++) {
-        if (energy[i - 1] < threshold && energy[i] >= threshold) {
-            starts.push(i / frameRate);
-        }
+    // If the song begins with vocals (no detected leading silence), treat
+    // time 0 as a valid phrase start so callers can enter at the song's
+    // very beginning. Without this, songs with no intro silence would have
+    // no early phrase candidates and vocal entry would be skipped entirely.
+    if (energy.length > 0 && (starts.length === 0 || starts[0] > 0.5)) {
+        let sum = 0;
+        for (let i = 0; i < energy.length; i++) sum += energy[i];
+        const mean = sum / energy.length;
+        if (energy[0] >= mean * 0.08) starts.unshift(0);
     }
+
     return starts;
 }
 
@@ -184,34 +207,42 @@ export function createTransitionPlan(
     song2VocalLeft: Float32Array,
     song2VocalRight: Float32Array,
     song2SampleRate: number,
+    song1BPM?: number,
+    song2BPM?: number,
 ): TransitionPlan {
-    // Smooth instrumental crossfade duration — long enough to blend naturally
-    const swapDuration = 8;
+    const rateRatio = computeRateRatio(song1BPM, song2BPM);
+    const rateRampDuration = 1.5;
+    // Smooth instrumental crossfade duration. The execution side splits this
+    // into: song-2 fade-in → song-1 duck-down → HELD blend (both audible) →
+    // long cross-trade (song 1 fades out, song 2 rises to full).
+    // 14s gives a generous ~3s held blend AND a ~6.5s cross-trade where both
+    // tracks are clearly audible while volumes shift.
+    const swapDuration = 14;
+    // After the instrumental crossfade finishes, song 1's vocals keep
+    // playing over song 2's full instrumental for at least this many
+    // seconds. This is the "song 1 vocals riding over the new beat"
+    // window — both timing windows below (search range and alignment
+    // clamp) honor this minimum so the alignment pass cannot eat it.
+    const MIN_VOCAL_OVERLAP = 6;
 
     // Analyze both vocal tracks
     const s1Energy = calculateVocalEnergy(song1VocalLeft, song1VocalRight, song1SampleRate);
     const s1Pauses = findVocalPauses(s1Energy.energy, s1Energy.frameRate, 0.25);
     const s2Energy = calculateVocalEnergy(song2VocalLeft, song2VocalRight, song2SampleRate);
 
-    // Instrumental crossfade starts ~75% of the song (at least swapDuration + 4s before end)
+    // Instrumental crossfade starts ~75% of the song; latestStart leaves
+    // room for the swap PLUS the vocal-overlap window PLUS a little tail.
     const idealStart = song1Duration * 0.75;
-    const latestStart = song1Duration - swapDuration - 4;
+    const latestStart = song1Duration - swapDuration - MIN_VOCAL_OVERLAP - 4;
     const swapTime = Math.min(idealStart, Math.max(latestStart, song1Duration * 0.55));
 
     // --- Find the best vocal switch point ---
-    // The user wants a VERY long period where song 2's instrumental is playing
-    // underneath song 1's vocals.
-    //
-    // With the 3-phase blend:
-    //   Phase 1 (song 2 fade-in) ends at swapTime + swapDuration * 0.35
-    //   Phase 2 (blend holding) ends at swapTime + swapDuration * 0.60
-    //   Phase 3 (song 1 fade-out) ends at swapTime + swapDuration
-    //
-    // We search for vocal pauses starting SEVERAL SECONDS AFTER the
-    // entire instrumental blend phase has finished. This ensures song 1's vocals play
-    // over song 2's new beat completely natively for a long, extended period.
-    const searchStart = swapTime + swapDuration + 4.0; // Starts 4s *after* the 8s swap finishes
-    const searchEnd = Math.min(swapTime + swapDuration + 14.0, song1Duration - 0.5); // Search up to 14s after swap
+    // We deliberately look for a song-1 vocal pause that sits AT LEAST
+    // MIN_VOCAL_OVERLAP seconds after the instrumental swap ends, so
+    // there's a clear window of "song 1 still singing over song 2's new
+    // bed at full volume."
+    const searchStart = swapTime + swapDuration + MIN_VOCAL_OVERLAP;       // earliest acceptable
+    const searchEnd = Math.min(swapTime + swapDuration + MIN_VOCAL_OVERLAP + 10, song1Duration - 0.5); // up to ~10s past that
 
     const candidates = s1Pauses.filter(
         (p) => p.start >= searchStart && p.start <= searchEnd,
@@ -275,8 +306,13 @@ export function createTransitionPlan(
                 3,
             );
         } else {
-            // Absolute fallback — end vocals exactly when the instrumental fade completes
-            vocalSwitchTime = swapTime + swapDuration;
+            // Absolute fallback — keep the overlap window even when no
+            // pause was found (better to cut vocals on a beat than to
+            // collapse the overlap entirely).
+            vocalSwitchTime = Math.min(
+                swapTime + swapDuration + MIN_VOCAL_OVERLAP,
+                song1Duration - 0.2,
+            );
             const s2InstPos = vocalSwitchTime - swapTime;
             song2VocalEntry = findNearestPhraseStart(
                 s2Energy.energy,
@@ -290,11 +326,121 @@ export function createTransitionPlan(
     // Pre-compute all phrase starts in song 2's vocals
     const song2PhraseStarts = findAllPhraseStarts(s2Energy.energy, s2Energy.frameRate);
 
+    // ── Vocal-entry alignment pass ────────────────────────────────
+    // Goal: song 2's vocals must enter within MAX_VOCAL_DELAY seconds
+    // after song 1's vocals end, AND at a natural phrase boundary.
+    //
+    // Strategy:
+    //   1. Compute song 2 instrumental's offset at vocalSwitchTime under the
+    //      current swapTime. If a phrase boundary falls inside the [0, MAX]
+    //      window past that offset, use it directly.
+    //   2. Otherwise, pick a desired phrase (the first reasonable one) and
+    //      shift crossfadeStart earlier so that the phrase lands inside the
+    //      window — i.e., song 2's instrumental starts playing earlier under
+    //      song 1's vocals so by the switch time it's at the right offset.
+    const TARGET_VOCAL_DELAY = 1.5;
+    const MAX_VOCAL_DELAY = 5;
+    let crossfadeStart = swapTime;
+
+    // Song 2 plays at `rateRatio` during the crossfade, so its buffer advances
+    // `rate × realSeconds`. All comparisons against song2PhraseStarts (buffer
+    // offsets) must therefore be scaled by rateRatio.
+    const s2BufferAtSwitch = (vocalSwitchTime - crossfadeStart) * rateRatio;
+    const phraseInWindow = song2PhraseStarts.find(
+        (p) => p >= s2BufferAtSwitch - 0.1 && p <= s2BufferAtSwitch + MAX_VOCAL_DELAY * rateRatio,
+    );
+
+    if (phraseInWindow !== undefined) {
+        // Existing timing already aligns naturally — nothing to do.
+        song2VocalEntry = phraseInWindow;
+    } else if (song2PhraseStarts.length > 0) {
+        const minStart = Math.max(swapDuration + 2, song1Duration * 0.2);
+        // Reserve MIN_VOCAL_OVERLAP seconds between swap end and vocal
+        // switch so song 1 keeps singing over song 2's instrumental for
+        // a noticeable window. Without this, the alignment can clamp
+        // crossfadeStart up to (vocalSwitchTime - swapDuration), making
+        // the swap finish exactly when vocals switch — zero overlap.
+        const maxStart = vocalSwitchTime - swapDuration - MIN_VOCAL_OVERLAP;
+
+        // ── Reachable phrase range ──
+        // crossfadeStart is bounded by [minStart, maxStart], so the song-2
+        // instrumental offset at vocal-entry time is bounded too:
+        //   (vocalSwitchTime + delay - crossfadeStart) * r,  delay ∈ [0, MAX]
+        // The earliest reachable phrase offset corresponds to crossfadeStart =
+        // maxStart (and delay = 0); the latest to crossfadeStart = minStart
+        // (and delay = MAX_VOCAL_DELAY). We must pick a target phrase inside
+        // this window — otherwise the clamp will silently shift crossfadeStart
+        // off the targeted phrase and vocals land mid-bar.
+        const minReachable = (swapDuration + MIN_VOCAL_OVERLAP) * rateRatio;
+        const maxReachable = (vocalSwitchTime + MAX_VOCAL_DELAY - minStart) * rateRatio;
+
+        // Prefer the EARLIEST reachable phrase — gives the tightest transition
+        // (vocal entry happens close to vocalSwitchTime, song 2 instrumental
+        // doesn't sit alone for too long after).
+        let targetPhrase = song2PhraseStarts.find(
+            (p) => p >= minReachable && p <= maxReachable,
+        );
+        if (targetPhrase === undefined) {
+            // No phrase in the reachable range — pick the phrase closest to
+            // the range. The clamp will absorb the residual mismatch and
+            // we'll still land on a real phrase boundary.
+            targetPhrase = song2PhraseStarts.reduce((best, p) => {
+                const dP = p < minReachable ? minReachable - p
+                        :  p > maxReachable ? p - maxReachable : 0;
+                const dB = best < minReachable ? minReachable - best
+                        :  best > maxReachable ? best - maxReachable : 0;
+                return dP < dB ? p : best;
+            }, song2PhraseStarts[0]);
+        }
+
+        // (vocalSwitchTime + TARGET - crossfadeStart) * r = targetPhrase
+        //   => crossfadeStart = vocalSwitchTime + TARGET - targetPhrase / r
+        const desired = vocalSwitchTime + TARGET_VOCAL_DELAY - targetPhrase / rateRatio;
+        crossfadeStart = Math.max(minStart, Math.min(maxStart, desired));
+
+        const newS2BufferAtSwitch = (vocalSwitchTime - crossfadeStart) * rateRatio;
+        const idealBuffer = newS2BufferAtSwitch + TARGET_VOCAL_DELAY * rateRatio;
+        const candidates = song2PhraseStarts.filter(
+            (p) =>
+                p >= newS2BufferAtSwitch - 0.1 &&
+                p <= newS2BufferAtSwitch + MAX_VOCAL_DELAY * rateRatio,
+        );
+        if (candidates.length > 0) {
+            song2VocalEntry = candidates.reduce(
+                (best, p) =>
+                    Math.abs(p - idealBuffer) < Math.abs(best - idealBuffer) ? p : best,
+                candidates[0],
+            );
+        } else {
+            const next = song2PhraseStarts.find((p) => p >= newS2BufferAtSwitch);
+            if (
+                next !== undefined &&
+                next - newS2BufferAtSwitch <= MAX_VOCAL_DELAY * rateRatio * 1.5
+            ) {
+                song2VocalEntry = next;
+            } else {
+                song2VocalEntry = idealBuffer;
+            }
+        }
+    } else {
+        // No detectable phrase boundaries at all — enter at the target delay
+        // past whatever offset song 2 instrumental is at when vocals switch.
+        song2VocalEntry = s2BufferAtSwitch + TARGET_VOCAL_DELAY * rateRatio;
+    }
+
+    // Defensive clamp — never plan a vocal entry past the song's end, otherwise
+    // the AudioBufferSource starts at the buffer's last sample and onended
+    // fires immediately, meaning no audible vocals.
+    const song2Duration = song2VocalLeft.length / song2SampleRate;
+    song2VocalEntry = Math.max(0, Math.min(song2VocalEntry, song2Duration - 0.5));
+
     return {
-        crossfadeStart: swapTime,
+        crossfadeStart,
         crossfadeDuration: swapDuration,
         vocalSwitchTime,
         song2VocalEntry,
         song2PhraseStarts,
+        song2RateRatio: rateRatio,
+        song2RateRampDuration: rateRampDuration,
     };
 }

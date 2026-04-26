@@ -19,6 +19,7 @@ export interface NewDJStemData {
     instrumentalBuffer: { left: Float32Array; right: Float32Array };
     duration: number;
     sampleRate: number;
+    bpm?: number; // detected from the instrumental at decode time; undefined if low confidence
 }
 
 export interface NewDJSong {
