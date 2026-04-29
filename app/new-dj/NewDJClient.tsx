@@ -1252,7 +1252,7 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
     }, [decodeAndAddSong]);
 
     // ── Process loose files ──
-    const processFiles = useCallback(async (files: File[]) => {
+    const processFiles = useCallback(async (files: File[], folderName?: string) => {
         setError(null);
         setIsLoading(true);
 
@@ -1280,7 +1280,7 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
                 .replace(/\.(wav|mp3)$/i, '')
                 .split('(')[0]
                 .trim();
-            let songName = derived || 'Untitled';
+            let songName = folderName || derived || 'Untitled';
             if (metaFile) {
                 try {
                     const metaText = await metaFile.text();
@@ -1305,7 +1305,7 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
 
     // ── File handling ──
     const handleInput = useCallback(
-        (files: FileList | File[] | null) => {
+        (files: FileList | File[] | null, folderName?: string) => {
             if (!files || files.length === 0) return;
             const fileArray = Array.from(files as Iterable<File>);
 
@@ -1316,7 +1316,7 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
                 const n = f.name.toLowerCase();
                 return n.endsWith('.wav') || n.endsWith('.mp3') || n === 'metadata.json';
             });
-            if (relevantFiles.length > 0) { processFiles(relevantFiles); return; }
+            if (relevantFiles.length > 0) { processFiles(relevantFiles, folderName); return; }
 
             setError('Please upload a .zip stems package or two audio files (.wav or .mp3) — one named with "vocal", the other with "music"/"instrumental".');
         },
@@ -1361,11 +1361,13 @@ function QuickStemPlayer({ audioCtx }: { audioCtx: React.RefObject<AudioContext 
                 }
                 if (entries.some(e => e.isDirectory)) {
                     const allFiles: File[] = [];
+                    let folderName = '';
                     for (const entry of entries) {
+                        if (entry.isDirectory && !folderName) folderName = entry.name;
                         const files = await readEntriesRecursive(entry);
                         allFiles.push(...files);
                     }
-                    if (allFiles.length > 0) { handleInput(allFiles); return; }
+                    if (allFiles.length > 0) { handleInput(allFiles, folderName); return; }
                 }
             }
             handleInput(e.dataTransfer.files);
